@@ -609,6 +609,7 @@ pub struct LiveContextEntriesPayload {
 #[serde(rename_all = "camelCase")]
 pub struct ExtractRelayCommonConfigPayload {
     pub common_config_contents: String,
+    pub context_config_contents: String,
     pub profile_config_contents: String,
 }
 
@@ -720,6 +721,8 @@ pub struct ContextDeleteRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ExtractRelayCommonConfigRequest {
     pub config_contents: String,
+    #[serde(default)]
+    pub context_config_contents: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -3734,9 +3737,13 @@ where
     F: FnOnce(&LaunchRequest) -> anyhow::Result<()>,
 {
     let mut warnings = Vec::new();
+    let mut tuning_rollback = None;
     let snapshot = if let Some(settings) = settings {
         let snapshot = RelayLiveSnapshot::capture(home)?;
-        if let Err(error) = sync_active_relay_to_home(settings, home) {
+        if let Err(error) = sync_active_relay_to_home_tracking(settings, home, &mut tuning_rollback) {
+            if error.to_string().contains("settings_revision_conflict") {
+                return Err(error);
+            }
             if let Err(restore_error) = snapshot.restore(home) {
                 anyhow::bail!("同步当前供应商失败：{error}；回滚 live 配置也失败：{restore_error}");
             }
@@ -3754,8 +3761,13 @@ where
 
     if let Err(error) = spawn(request) {
         if let Some(snapshot) = snapshot {
-            if let Err(restore_error) = snapshot.restore(home) {
-                anyhow::bail!("启动 Codex 失败：{error}；回滚 live 配置也失败：{restore_error}");
+            let restore = || snapshot.restore(home);
+            let restored = match tuning_rollback {
+                Some(receipt) => receipt.restore(restore),
+                None => restore(),
+            };
+            if let Err(restore_error) = restored {
+                anyhow::bail!("启动 Codex 失败：{error}；回滚配置也失败：{restore_error}");
             }
         }
         return Err(error);
@@ -3815,23 +3827,42 @@ fn apply_relay_profile_honoring_preservation(
     relay: &RelayProfile,
     settings: &BackendSettings,
 ) -> anyhow::Result<codex_plus_core::relay_config::RelayApplyResult> {
-    codex_plus_core::relay_config::apply_relay_profile_with_preservation(
-        home,
-        relay,
-        &relay_combined_common_config(settings),
-        codex_plus_core::protocol_proxy::protocol_proxy_port(),
-        settings.relay_preserve_nonprovider_settings,
-    )
+    reapply_template(home, relay, settings).map(|(result, _)| result)
 }
 
+fn reapply_template(home: &Path, relay: &RelayProfile, settings: &BackendSettings)
+    -> anyhow::Result<(codex_plus_core::relay_config::RelayApplyResult, Option<codex_plus_core::session_tuning::TemplateReapplyRollback>)>
+{
+    let common = relay_combined_common_config(settings);
+    let port = codex_plus_core::protocol_proxy::protocol_proxy_port();
+    codex_plus_core::session_tuning::with_template_reapply(&SettingsStore::default(), settings, || {
+        codex_plus_core::relay_config::apply_relay_profile_with_preservation(
+            home, relay, &common, port, settings.relay_preserve_nonprovider_settings,
+        )
+    })
+}
+
+#[cfg(test)]
 fn sync_active_relay_to_home(
     settings: &BackendSettings,
     home: &Path,
+) -> anyhow::Result<codex_plus_core::relay_config::RelayApplyResult> {
+    sync_active_relay_to_home_tracking(settings, home, &mut None)
+}
+
+fn sync_active_relay_to_home_tracking(
+    settings: &BackendSettings,
+    home: &Path,
+    rollback: &mut Option<codex_plus_core::session_tuning::TemplateReapplyRollback>,
 ) -> anyhow::Result<codex_plus_core::relay_config::RelayApplyResult> {
     if !settings.relay_profiles_enabled {
         anyhow::bail!("供应商配置总开关已关闭，未同步 live 配置");
     }
     let relay = settings.active_relay_profile();
+    let mut apply = || reapply_template(home, &relay, settings).map(|(result, receipt)| {
+        *rollback = receipt;
+        result
+    });
     if relay.relay_mode == codex_plus_core::settings::RelayMode::Aggregate {
         if settings.active_aggregate_relay_profile().is_none() {
             anyhow::bail!("当前聚合供应商配置不完整");
@@ -3840,7 +3871,7 @@ fn sync_active_relay_to_home(
             .active_aggregate_relay_profile()
             .ok_or_else(|| anyhow::anyhow!("当前聚合供应商配置不完整"))?;
         if aggregate.model_aggregation_enabled {
-            return apply_relay_profile_honoring_preservation(home, &relay, settings);
+            return apply();
         }
         return codex_plus_core::relay_config::apply_relay_config_to_home_with_session_provider(
             home,
@@ -3864,7 +3895,7 @@ fn sync_active_relay_to_home(
         );
     }
     if relay_has_complete_files(&relay) {
-        return apply_relay_profile_honoring_preservation(home, &relay, settings);
+        return apply();
     }
 
     let mut base_url = relay.base_url.trim().to_string();
@@ -4827,21 +4858,6 @@ pub fn save_settings(
     if let Some(revision) = expected_revision {
         settings.settings_revision = revision;
     }
-    let mut settings = normalize_settings_before_save(settings);
-    // 保存诊断：供应商模型列表被改小/改大时能直接看出「提交上来的到底是什么」。
-    // 用户反馈过「删掉一行保存后又变回三行」，只有把每次保存的行数记下来才能区分
-    // 「界面没提交改动」和「提交了又被别处覆盖」。
-    log_manager_event(
-        "manager.save_settings",
-        json!({
-            "activeRelayId": settings.active_relay_id,
-            "relayProfiles": settings.relay_profiles.iter().map(|profile| json!({
-                "id": profile.id,
-                "modelCount": profile.model_list.lines().filter(|line| !line.trim().is_empty()).count(),
-                "models": profile.model_list.lines().filter(|line| !line.trim().is_empty()).collect::<Vec<_>>(),
-            })).collect::<Vec<_>>(),
-        }),
-    );
     let Ok(_guard) = relay_switch_mutex().lock() else {
         return failed(
             "供应商切换锁已损坏，请重启管理器后再试。",
@@ -4856,7 +4872,34 @@ pub fn save_settings(
         );
     };
     let store = SettingsStore::default();
-    let previous = store.load().unwrap_or_default();
+    let previous = match store.load() {
+        Ok(previous) => previous,
+        Err(error) => return failed(&error.to_string(), fallback_settings_payload()),
+    };
+    if previous.relay_common_config_contents != settings.relay_common_config_contents
+        && let Err(error) = codex_plus_core::relay_config::validate_shared_config_draft(
+            &settings.relay_common_config_contents,
+        )
+    {
+        return failed(&error.to_string(), SettingsPayload {
+            revision: previous.settings_revision.clone(),
+            settings: previous,
+            settings_path: codex_plus_core::paths::default_settings_path().display().to_string(),
+            user_scripts: user_script_inventory(),
+        });
+    }
+    let mut settings = normalize_settings_before_save(settings);
+    log_manager_event(
+        "manager.save_settings",
+        json!({
+            "activeRelayId": settings.active_relay_id,
+            "relayProfiles": settings.relay_profiles.iter().map(|profile| json!({
+                "id": profile.id,
+                "modelCount": profile.model_list.lines().filter(|line| !line.trim().is_empty()).count(),
+                "models": profile.model_list.lines().filter(|line| !line.trim().is_empty()).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        }),
+    );
     // 原生登录仅由独立选择命令更新，普通偏好表单不能覆盖刚发布的身份。
     settings.native_auth_selection = previous.native_auth_selection.clone();
     if let Err(error) = codex_plus_core::connect::outbound::validate_settings_change(&previous, &settings) {
@@ -6277,10 +6320,10 @@ fn normalize_settings_before_save(mut settings: BackendSettings) -> BackendSetti
             &settings.relay_common_config_contents,
         );
     let (common_without_context, extracted_context) =
-        split_relay_context_config_sections(&settings.relay_common_config_contents);
+        codex_plus_core::relay_config::split_context_config_sections(&settings.relay_common_config_contents);
     settings.relay_common_config_contents = common_without_context;
     settings.relay_context_config_contents =
-        relay_join_config_sections(&[&settings.relay_context_config_contents, &extracted_context]);
+        codex_plus_core::relay_config::join_config_sections(&settings.relay_context_config_contents, &extracted_context);
     settings.relay_context_config_contents =
         codex_plus_core::relay_config::sanitize_common_config_contents(
             &settings.relay_context_config_contents,
@@ -6380,54 +6423,33 @@ fn normalize_provider_sync_provider_list(values: Vec<String>) -> Vec<String> {
 }
 
 fn relay_combined_common_config(settings: &BackendSettings) -> String {
-    relay_join_config_sections(&[
+    codex_plus_core::relay_config::join_config_sections(
         &settings.relay_common_config_contents,
         &settings.relay_context_config_contents,
-    ])
-}
-
-fn relay_join_config_sections(sections: &[&str]) -> String {
-    let sections = sections
-        .iter()
-        .map(|section| section.trim())
-        .filter(|section| !section.is_empty())
-        .collect::<Vec<_>>();
-    if sections.is_empty() {
-        String::new()
-    } else {
-        codex_plus_core::relay_config::normalize_config_text(&format!(
-            "{}\n",
-            sections.join("\n\n")
-        ))
-    }
-}
-
-fn split_relay_context_config_sections(config: &str) -> (String, String) {
-    let mut common = Vec::new();
-    let mut context = Vec::new();
-    let mut in_context_table = false;
-
-    for line in config.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            in_context_table = trimmed.starts_with("[mcp_servers.")
-                || trimmed.starts_with("[skills.")
-                || trimmed.starts_with("[plugins.");
-        }
-        if in_context_table {
-            context.push(line);
-        } else {
-            common.push(line);
-        }
-    }
-
-    (
-        relay_join_config_sections(&[&common.join("\n")]),
-        relay_join_config_sections(&[&context.join("\n")]),
     )
 }
 
 fn strip_common_config_text_fallback(config_contents: &str, common_config: &str) -> String {
+    if let (Ok(mut profile), Ok(common)) = (
+        config_contents.parse::<toml_edit::DocumentMut>(),
+        common_config.parse::<toml_edit::DocumentMut>(),
+    ) {
+        // 旧快照里，拼在表头后面的通用根键会变成表内的同名副本。
+        // 正常的共享字段已由 core 去除；这里不能把供应商剩下的整张表删掉。
+        for (key, value) in common.iter().filter(|(_, item)| item.is_value() && !item.is_table_like()) {
+            if !codex_plus_core::session_tuning::is_tuning_key(key) {
+                profile.remove(key);
+            }
+            for (section, _) in common.iter().filter(|(_, item)| item.is_table_like()) {
+                if let Some(table) = profile.get_mut(section).and_then(toml_edit::Item::as_table_like_mut)
+                    && table.get(key).is_some_and(|copy| copy.to_string().trim() == value.to_string().trim())
+                {
+                    table.remove(key);
+                }
+            }
+        }
+        return codex_plus_core::relay_config::normalize_config_text(&profile.to_string());
+    }
     let common = common_config_anchors(common_config);
     if common.root_keys.is_empty() && common.table_headers.is_empty() {
         return ensure_text_newline(config_contents.trim_end());
@@ -6511,7 +6533,9 @@ fn common_config_anchors(common_config: &str) -> CommonConfigAnchors {
         }
         if !in_table {
             if let Some(key) = toml_key_from_line(trimmed) {
-                root_keys.insert(key.to_string());
+                if !codex_plus_core::session_tuning::is_tuning_key(key) {
+                    root_keys.insert(key.to_string());
+                }
             }
         }
     }
@@ -10247,8 +10271,18 @@ pub fn extract_relay_common_config(
                     &request.config_contents,
                     &common_config_contents,
                 )?;
+            let (common_config_contents, context_config_contents) =
+                codex_plus_core::relay_config::split_context_config_sections(&common_config_contents);
             Ok(ExtractRelayCommonConfigPayload {
                 common_config_contents,
+                context_config_contents: if context_config_contents.is_empty() {
+                    String::new()
+                } else {
+                    codex_plus_core::relay_config::join_config_sections(
+                        &context_config_contents,
+                        &request.context_config_contents,
+                    )
+                },
                 profile_config_contents,
             })
         }) {
@@ -10257,6 +10291,7 @@ pub fn extract_relay_common_config(
             &format!("提取通用配置失败：{error}"),
             ExtractRelayCommonConfigPayload {
                 common_config_contents: String::new(),
+                context_config_contents: String::new(),
                 profile_config_contents: request.config_contents,
             },
         ),
@@ -12316,6 +12351,48 @@ cwd = \"/tmp\"
     }
 
     #[test]
+    fn manager_preferences_save_validates_raw_shared_template_before_migration() {
+        let _guard = lock_codex_home_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        let previous = codex_plus_core::paths::set_settings_path_for_tests(Some(path.clone()));
+        let store = SettingsStore::default();
+        store.save(&BackendSettings {
+            enhancements_enabled: false,
+            relay_context_config_contents: "[mcp_servers.keep]\ncommand = 'keep'\n".into(),
+            ..BackendSettings::default()
+        }).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut settings = store.load().unwrap();
+        for invalid in [
+            "description = 1\ndescription = 2", "[unterminated",
+            "'plugins'.example = {enabled = true}", "[ 'mcp_servers'.example ] # real",
+            "skills = { config = [] }",
+        ] {
+            settings.relay_common_config_contents = invalid.into();
+            let result = save_settings(settings.clone(), None);
+            assert_eq!(result.status, "failed", "{invalid}");
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        let template = "developer_instructions = '''\n[plugins.example]\n[plugins.example]\n'''\n[permissions.mine] # keep\ndescription = 'work'\n";
+        settings.relay_common_config_contents = template.into();
+        let result = save_settings(settings, None);
+        let saved = store.load().unwrap();
+        assert_eq!(result.status, "ok", "{}", result.message);
+        assert_eq!(saved.relay_common_config_contents, template);
+        assert_eq!(saved.relay_context_config_contents, "[mcp_servers.keep]\ncommand = 'keep'\n");
+        let mut legacy = saved;
+        legacy.relay_common_config_contents = "[unfinished\n".into();
+        store.save(&legacy).unwrap();
+        let mut other_change = store.load().unwrap();
+        other_change.provider_sync_enabled = !other_change.provider_sync_enabled;
+        let result = save_settings(other_change, None);
+        codex_plus_core::paths::set_settings_path_for_tests(previous);
+        assert_eq!(result.status, "ok", "{}", result.message);
+        assert_eq!(result.payload.settings.relay_common_config_contents, "[unfinished\n");
+    }
+
+    #[test]
     fn manager_preferences_save_preserves_the_latest_explicit_native_login() {
         let _guard = lock_codex_home_for_test();
         let temp = tempfile::tempdir().unwrap();
@@ -14169,6 +14246,25 @@ enabled = true
     }
 
     #[test]
+    fn normalize_settings_before_save_preserves_distinct_tuning_override() {
+        let settings = BackendSettings {
+            relay_common_config_contents: "tool_output_token_limit = 4096\n".into(),
+            relay_profiles: vec![RelayProfile {
+                use_common_config: true,
+                config_contents: "tool_output_token_limit = 999\n".into(),
+                ..RelayProfile::default()
+            }],
+            ..BackendSettings::default()
+        };
+        let saved = normalize_settings_before_save(settings);
+        assert!(
+            saved.relay_profiles[0]
+                .config_contents
+                .contains("tool_output_token_limit = 999")
+        );
+    }
+
+    #[test]
     fn normalize_settings_before_save_strips_common_from_enabled_profile() {
         let settings = BackendSettings {
             relay_common_config_contents: r#"model_reasoning_effort = "high"
@@ -14184,10 +14280,15 @@ enabled = true
                 use_common_config: true,
                 config_contents: r#"model = "gpt-5"
 model_reasoning_effort = "high"
+developer_instructions = '''
+[plugins."superpowers@openai-curated"]
+model_reasoning_effort = "example"
+'''
 
 [features]
 goals = true
 model_reasoning_effort = "high"
+profile_only = true
 
 [plugins."superpowers@openai-curated"]
 enabled = true
@@ -14202,12 +14303,16 @@ enabled = true
         let config = &normalized.relay_profiles[0].config_contents;
 
         assert!(config.contains("model = \"gpt-5\""));
-        assert!(!config.contains("model_reasoning_effort"));
+        let doc = config.parse::<toml_edit::DocumentMut>().unwrap();
+        assert!(doc.get("model_reasoning_effort").is_none());
+        assert!(doc["features"].get("model_reasoning_effort").is_none());
+        assert_eq!(doc["features"]["profile_only"].as_bool(), Some(true));
+        assert_eq!(doc["developer_instructions"].as_str(), Some("[plugins.\"superpowers@openai-curated\"]\nmodel_reasoning_effort = \"example\"\n"));
         // `goals` is an explicit per-profile override and must survive
         // normalization even when it matches the common configuration.
         assert!(config.contains("[features]"));
         assert!(config.contains("goals = true"));
-        assert!(!config.contains("[plugins.\"superpowers@openai-curated\"]"));
+        assert!(doc.get("plugins").is_none());
     }
 
     #[test]

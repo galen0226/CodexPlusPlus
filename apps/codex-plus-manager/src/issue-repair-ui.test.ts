@@ -134,6 +134,7 @@ test("all full saves require their own revision and conflicts preserve the calle
   const context = vm.createContext({
     invoke: async (_command: string, args: unknown) => { request = args; return { message: "settings_revision_conflict: newer settings exist", status: "failed" }; },
     retrySaveSettingsAfterConflict: async () => null,
+    settingsRef: { current: null },
   });
   vm.runInContext(ts.transpileModule(`const call = ${initializer}; globalThis.callTest = call;`, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context);
   const draft = { revision: "old", model: "draft-model" };

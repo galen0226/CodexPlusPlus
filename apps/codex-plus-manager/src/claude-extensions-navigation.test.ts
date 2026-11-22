@@ -49,6 +49,7 @@ const icons = [...text.matchAll(/icon: (\w+)/g)].map((match) => match[1]);
 const transpile = (source: string) => ts.transpileModule(source, {
   compilerOptions: { jsx: ts.JsxEmit.React, target: ts.ScriptTarget.ES2022 },
 }).outputText;
+const settingsSync = ["rebaseConfigDraft", "acceptExternalSettings"].map((name) => `const ${declaration(name).getText(app)};`).join("\n");
 
 type Element = { type: string | ((...args: any[]) => any); props: Record<string, any> };
 function elements(node: any): Element[] {
@@ -451,6 +452,8 @@ function extensionActionHarness(result: ActionResult | null, reloadStatus?: stri
       requests.push({ command, payload: structuredClone(payload) });
       return result;
     },
+    settingsRef: { current: { settings: { ...draft } } },
+    normalizeSettings: (value: unknown) => value,
     setSettings: (next: ActionResult) => {
       events.push("settings");
       state.settings = next;
@@ -472,6 +475,7 @@ function extensionActionHarness(result: ActionResult | null, reloadStatus?: stri
   vm.runInContext(transpile([
     functionSource("isSuccessStatus"),
     functionSource("syncMarketInstalledState"),
+    settingsSync,
     ...actionNames.map((name) => `const ${declaration(name).getText(app)}; globalThis.${name} = ${name};`),
   ].join("\n")), context);
   return { context, requests, events, state, draft, memo, originalMemo };
@@ -612,6 +616,7 @@ test("后台设置变更事件同步 Claude 和 Computer Use 字段及 revision�
   };
   const draft = {
     revision: 3,
+    relayCommonConfigContents: "",
     computerUseMode: "local",
     computerUseApproval: "never",
     computerUsePip: false,
@@ -629,7 +634,7 @@ test("后台设置变更事件同步 Claude 和 Computer Use 字段及 revision�
   const originalDraft = structuredClone(draft);
   const result = {
     status: "ok",
-    settings: { ...changed, revision: 4, theme: "saved-theme", providerDraft: { model: "saved-model" } },
+    settings: { ...changed, revision: 4, relayCommonConfigContents: "", theme: "saved-theme", providerDraft: { model: "saved-model" } },
   };
   const eventName = "codex-plus:backend-settings-changed";
   const listeners = new Map<string, () => void>();
@@ -638,6 +643,7 @@ test("后台设置变更事件同步 Claude 和 Computer Use 字段及 revision�
   let form = draft;
   const context = vm.createContext({
     BACKEND_SETTINGS_CHANGED_EVENT: eventName,
+    settingsRef: { current: { settings: originalDraft } },
     window: {
       addEventListener: (name: string, handler: () => void) => listeners.set(name, handler),
       removeEventListener: (name: string, handler: () => void) => {
@@ -654,7 +660,7 @@ test("后台设置变更事件同步 Claude 和 Computer Use 字段及 revision�
     setSettings: (value: typeof result) => updates.push(value),
     setSettingsForm: (update: (current: typeof draft) => typeof draft) => { form = update(form); },
   });
-  vm.runInContext(transpile(`globalThis.mount = ${effects[0].getText(app)};`), context);
+  vm.runInContext(transpile(`${settingsSync}\n${functionSource("isSuccessStatus")}\nglobalThis.mount = ${effects[0].getText(app)};`), context);
   const cleanup = context.mount() as () => void;
   assert.deepEqual(Array.from(listeners.keys()), [eventName]);
   listeners.get(eventName)!();

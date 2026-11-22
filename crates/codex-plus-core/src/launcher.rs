@@ -1370,20 +1370,13 @@ impl LaunchHooks for DefaultLaunchHooks {
         }
         let profile = settings.active_relay_profile();
         let home = crate::relay_config::default_codex_home_dir();
-        let common_config = crate::relay_config::normalize_config_text(
-            &[
-                settings.relay_common_config_contents.as_str(),
-                settings.relay_context_config_contents.as_str(),
-            ]
-            .into_iter()
-            .map(str::trim)
-            .filter(|section| !section.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n"),
+        let common_config = crate::relay_config::join_config_sections(
+            &settings.relay_common_config_contents,
+            &settings.relay_context_config_contents,
         );
-        crate::relay_config::apply_relay_profile_with_preservation(
+        crate::session_tuning::with_template_reapply(&SettingsStore::default(), settings, || crate::relay_config::apply_relay_profile_with_preservation(
             &home, &profile, &common_config, crate::protocol_proxy::protocol_proxy_port(), settings.relay_preserve_nonprovider_settings,
-        )?;
+        ))?;
         Ok(())
     }
 

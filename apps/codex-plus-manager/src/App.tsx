@@ -122,7 +122,6 @@ import {
   parseContextEntries,
   selectedContextConfigToml,
   setContextEntryEnabled,
-  splitContextConfigText,
   stripContextEntriesFromConfig,
   type CodexContextEntries,
   type CodexContextEntry,
@@ -130,7 +129,7 @@ import {
 } from "./context-config-text";
 import { summarizeRecentRequests, type RecentRequestSummary } from "./overview-model";
 import { AgentCollaborationPage } from "./AgentCollaborationPage";
-import { AgentConfigButton, AgentConfigDialog, OpenAgentConfig, type ConfigTarget } from "./AgentConfigEditor";
+import { AgentConfigDialog, OpenAgentConfig, type ConfigTarget } from "./AgentConfigEditor";
 import { DshPluginsPanel } from "./DshPluginsPanel";
 import { ConfigDoctorPanel } from "./ConfigDoctorPanel";
 import { CommunityExtensionsPanel, type CommunitySort } from "./CommunityExtensionsPanel";
@@ -553,6 +552,13 @@ export type BackendSettings = WhaleBalanceSettings & {
   codexAppAutoTakeover: boolean;
   codexAppAutoTakeoverWhenActive: string;
   claudeAppExtensions?: boolean;
+  claudeAppVoiceInput?: boolean;
+  claudeAppLocalization?: boolean;
+  claudeAppComputerUse?: boolean;
+  claudeAppBashTimeout?: ClaudeBashTimeoutSettings;
+  computerUseMode?: string;
+  computerUseApproval?: string;
+  computerUsePip?: boolean;
   claudeDesktopLocal?: ClaudeLocalConfig;
   codexExtraArgs: string[];
   dictation: DictationSettings;
@@ -1059,6 +1065,7 @@ type LiveContextEntriesResult = CommandResult<{
 
 type ExtractRelayCommonConfigResult = CommandResult<{
   commonConfigContents: string;
+  contextConfigContents: string;
   profileConfigContents: string;
 }>;
 
@@ -1805,6 +1812,7 @@ export function App() {
   const [settingsSections, setSettingsSections] = useState<string[]>(() => settingsSectionsFor(initialSettingsFocus() ?? "app-settings-general"));
   /** 从旧的「旧版代理设置」入口进来：「连接与供应商」页直接展开「高级」。 */
   const [relayAdvancedOpen, setRelayAdvancedOpen] = useState(false);
+  const [relayCommonOpen, setRelayCommonOpen] = useState(false);
   /** 进设置模式前停的页面：侧栏「返回」回到这里。 */
   const lastMainRoute = useRef<Route>("hub");
   const [notice, setNotice] = useState<{ title: string; message: string; status?: Status } | null>(null);
@@ -1833,6 +1841,7 @@ export function App() {
   const [weixinQr, setWeixinQr] = useState<WeixinQrResult | null>(null);
   const [relay, setRelay] = useState<RelayResult | null>(null);
   const [relayFiles, setRelayFiles] = useState<RelayFilesResult | null>(null);
+  const relayFilesRead = useRef(0);
   const [envConflicts, setEnvConflicts] = useState<EnvConflictsResult | null>(null);
   const [relayEnvironment, setRelayEnvironment] = useState<RelayEnvironmentResult | null>(null);
   const [ccsProviders, setCcsProviders] = useState<CcsProvidersResult | null>(null);
@@ -2010,14 +2019,47 @@ export function App() {
     [settings, settingsForm],
   );
 
+  // 只有能确认通用模板和供应商快照归属的草稿才能推进版本。冲突时保留草稿，保存重试则停止。
+  const rebaseConfigDraft = (draft: BackendSettings, base: BackendSettings, fresh: BackendSettings,
+    { keepOtherFields = false } = {}): BackendSettings | null => {
+    if (draft.revision !== base.revision) return null;
+    const localCommon = draft.relayCommonConfigContents;
+    const diskCommon = fresh.relayCommonConfigContents;
+    if (localCommon !== base.relayCommonConfigContents && diskCommon !== base.relayCommonConfigContents
+      && localCommon !== diskCommon) return null;
+    const merged = keepOtherFields ? draft : rebaseSettingsEdits(draft, base, fresh);
+    const next = {
+      ...merged,
+      revision: fresh.revision,
+      relayCommonConfigContents: localCommon === base.relayCommonConfigContents ? diskCommon : localCommon,
+    };
+    if (merged.relayProfiles === fresh.relayProfiles) return next;
+    const before = new Map(base.relayProfiles.map(profile => [profile.id, profile.configContents]));
+    const after = new Map(fresh.relayProfiles.map(profile => [profile.id, profile.configContents]));
+    const profiles: RelayProfile[] = [];
+    for (const profile of merged.relayProfiles) {
+      const original = before.get(profile.id);
+      const saved = after.get(profile.id);
+      if (diskCommon !== base.relayCommonConfigContents && profile.id === base.activeRelayId
+        && original !== undefined && profile.configContents !== original && profile.configContents !== saved) return null;
+      if (original !== undefined && saved !== undefined && saved !== original && profile.configContents !== saved) {
+        if (profile.configContents !== original) return null;
+        profiles.push({ ...profile, configContents: saved });
+      } else {
+        profiles.push(profile);
+      }
+    }
+    return { ...next, relayProfiles: profiles };
+  };
+
   /// 保存撞上 settings_revision_conflict（后台 token 刷新等抢先写盘）时自动恢复：
   /// 拉最新设置，把本次提交的编辑 rebase 上去、合并外部轮换的登录 token 后重试一次；
   /// 再次冲突或读取失败返回 null，由调用方按原逻辑抛错、保留草稿。
   const retrySaveSettingsAfterConflict = async <T,>(
     args: Record<string, unknown> | undefined,
     snapshot: BackendSettings | undefined,
+    previous: BackendSettings | undefined,
   ): Promise<T | null> => {
-    const previous = settingsRef.current?.settings;
     if (!snapshot || !previous) return null;
     let latest: SettingsResult;
     try {
@@ -2028,15 +2070,12 @@ export function App() {
     if (!latest || !isSuccessStatus(latest.status)) return null;
     const base = normalizeSettings(previous);
     const fresh = normalizeSettings(latest.settings);
-    const merged = mergeRotatedAuthContents(
-      rebaseSettingsEdits(normalizeSettings(snapshot), base, fresh),
-      base,
-      fresh,
-    );
+    const merged = rebaseConfigDraft(normalizeSettings(snapshot), base, fresh);
+    if (!merged) return null;
     try {
       const retried = await invoke<T>("save_settings", {
         ...args,
-        settings: merged,
+        settings: mergeRotatedAuthContents(merged, base, fresh),
         expectedRevision: merged.revision || "",
       });
       const response = retried as { message?: string };
@@ -2049,12 +2088,13 @@ export function App() {
 
   const call = <T,>(command: string, args?: Record<string, unknown>) => {
     const snapshot = args?.settings as BackendSettings | undefined;
+    const previous = command === "save_settings" ? settingsRef.current?.settings : undefined;
     return invoke<T>(command, command === "save_settings"
       ? { ...args, expectedRevision: snapshot?.revision || "" }
       : args).then(async (result) => {
         const response = result as { message?: string };
         if (command === "save_settings" && response?.message?.includes("settings_revision_conflict")) {
-          const recovered = await retrySaveSettingsAfterConflict<T>(args, snapshot);
+          const recovered = await retrySaveSettingsAfterConflict<T>(args, snapshot, previous);
           if (recovered !== null) return recovered;
           // 所有保存调用都保留当前草稿，不能把失败响应当成新表单回填。
           throw new Error(response.message);
@@ -2147,20 +2187,12 @@ export function App() {
   useEffect(() => {
     const sync = async () => {
       const result = await run(() => call<SettingsResult>("load_settings"));
-      if (!result) return;
-      const fresh = normalizeSettings(result.settings) as BackendSettings & Record<string, unknown>;
-      setSettings(result);
-      setSettingsForm((current) => {
-        const merged: Record<string, unknown> = { ...current, revision: fresh.revision };
-        for (const key of [
-          "computerUseMode", "computerUseApproval", "computerUsePip",
-          "claudeAppVoiceInput", "claudeAppLocalization", "claudeAppExtensions", "claudeAppComputerUse", "claudeAppBashTimeout", "claudeDesktopLocal",
-          // 使用模式也要带上：表单留着旧值，下一次整份保存会把刚记下的模式写回去。
-          "managerAgentFocus",
-          "nativeAuthSelection",
-        ]) merged[key] = fresh[key];
-        return merged as BackendSettings;
-      });
+      if (!result || !isSuccessStatus(result.status)) return;
+      acceptExternalSettings(result, { syncOnly: [
+        "computerUseMode", "computerUseApproval", "computerUsePip",
+        "claudeAppVoiceInput", "claudeAppLocalization", "claudeAppExtensions", "claudeAppComputerUse", "claudeAppBashTimeout", "claudeDesktopLocal",
+        "managerAgentFocus", "nativeAuthSelection",
+      ] });
     };
     const handler = () => void sync();
     window.addEventListener(BACKEND_SETTINGS_CHANGED_EVENT, handler);
@@ -2258,18 +2290,13 @@ export function App() {
   const setUserScriptsEnabled = async (enabled: boolean, host: ExtensionHost = "codex") => {
     const result = await run(() => call<SettingsResult>("set_user_scripts_enabled", { enabled, ...(host === "claude" ? { host } : {}) }));
     if (!result) return;
-    setSettings(result);
     setScriptMarket((current) => syncMarketInstalledState(current, result.user_scripts));
     if (host === "claude" && isSuccessStatus(result.status)) {
-      setSettingsForm((current) => ({
-        ...current,
-        revision: result.settings.revision,
-        claudeAppExtensions: result.settings.claudeAppExtensions,
-      }));
+      acceptExternalSettings(result, { syncOnly: ["claudeAppExtensions"] });
       if (claudeLocalizationMemo.status) {
         claudeLocalizationMemo.status = { ...claudeLocalizationMemo.status, extensions: result.user_scripts?.claude_enabled === true };
       }
-    }
+    } else setSettings(result);
     showResultNotice(t("本地拓展"), result);
     if (isSuccessStatus(result.status) && host === "codex") await reloadUserScripts();
   };
@@ -2341,7 +2368,9 @@ export function App() {
   };
 
   const refreshRelayFiles = async (silent = false) => {
+    const read = ++relayFilesRead.current;
     const result = await run(() => call<RelayFilesResult>("read_relay_files"));
+    if (read !== relayFilesRead.current) return null;
     if (result) {
       setRelayFiles(result);
       if (!silent) showResultNotice(t("配置文件"), result, { silentSuccess: true });
@@ -3069,6 +3098,7 @@ export function App() {
       runAfterDreamSkinDraftGuard(() => void navigate(next, true));
       return;
     }
+    setRelayCommonOpen(false);
     setRoute(next);
     if (next === "overview") await refreshOverview(true);
     if (next === "relay" || next === "multiLaunch") {
@@ -3474,9 +3504,7 @@ export function App() {
         showNotice(t("跳过此版本"), result.message, "failed");
         return;
       }
-      const fresh = normalizeSettings(result.settings);
-      setSettings(result);
-      setSettingsForm((current) => ({ ...current, updateSkippedVersion: fresh.updateSkippedVersion, revision: fresh.revision }));
+      acceptExternalSettings(result, { syncOnly: ["updateSkippedVersion"] });
     } catch (error) {
       showNotice(t("跳过此版本"), stringifyError(error), "failed");
     }
@@ -3649,13 +3677,9 @@ export function App() {
         return false;
       }
       const saved = normalizeSettings(result.settings);
-      const previous = normalizeSettings(settingsRef.current?.settings ?? latest.settings);
-      setSettings(result);
+      acceptExternalSettings(result);
       // 模式选择只修改这一个开关；其他页面尚未保存的编辑继续保留。
-      setSettingsForm((current) => ({
-        ...rebaseSettingsEdits(normalizeSettings(current), previous, saved),
-        relayProfilesEnabled: false,
-      }));
+      setSettingsForm((current) => ({ ...current, relayProfilesEnabled: false }));
       return !saved.relayProfilesEnabled;
     },
     commit: (next) => {
@@ -3677,7 +3701,8 @@ export function App() {
       if (!isSuccessStatus(result.status)) return { status: "failed", message: result.message };
       const saved = normalizeSettings(result.settings);
       setSettings(result);
-      setSettingsForm((current) => (backendSettingsEqual(current, snapshot) ? saved : { ...current, revision: saved.revision }));
+      setSettingsForm((current) => rebaseConfigDraft(current, normalized, saved,
+        { keepOtherFields: !backendSettingsEqual(current, snapshot) }) ?? current);
       return { status: "saved" };
     } catch (error) {
       return { status: "failed", message: stringifyError(error) };
@@ -4168,10 +4193,10 @@ export function App() {
     return isSuccessStatus(result.status) ? normalized : null;
   };
 
-  const extractRelayCommonConfig = async (configContents: string) => {
+  const extractRelayCommonConfig = async (configContents: string, contextConfigContents: string) => {
     const result = await run(() =>
       call<ExtractRelayCommonConfigResult>("extract_relay_common_config", {
-        request: { configContents },
+        request: { configContents, contextConfigContents },
       }),
     );
     if (result) showResultNotice(t("通用配置文件"), result);
@@ -4621,6 +4646,49 @@ export function App() {
     return () => window.removeEventListener("focus", refresh);
   }, []);
 
+  const acceptExternalSettings = (result: SettingsResult, { syncOnly }: {
+    syncOnly?: readonly Exclude<keyof BackendSettings, "revision" | "relayProfiles" | "relayCommonConfigContents">[];
+  } = {}) => {
+    const previous = settingsRef.current?.settings;
+    const latest = normalizeSettings(result.settings);
+    const base = previous && normalizeSettings(previous);
+    if (base && (latest.relayCommonConfigContents !== base.relayCommonConfigContents
+      || (latest.activeRelayId === base.activeRelayId && latest.activeRelayId
+        && latest.relayProfiles.find(profile => profile.id === latest.activeRelayId)?.configContents
+          !== base.relayProfiles.find(profile => profile.id === base.activeRelayId)?.configContents))) {
+      ++relayFilesRead.current;
+      setRelayFiles(null);
+    }
+    setSettings(result);
+    setSettingsForm((current) => {
+      if (!base) return current.revision ? current : latest;
+      const next = rebaseConfigDraft(normalizeSettings(current), base, latest,
+        { keepOtherFields: !!syncOnly }) ?? current;
+      return syncOnly ? { ...next, ...Object.fromEntries(syncOnly.map(key => [key, latest[key]])) } : next;
+    });
+  };
+
+  const saveCommonTemplate = async (original: string, text: string) => {
+    const current = settingsRef.current;
+    if (!current || !isSuccessStatus(current.status)) {
+      showNotice(t("设置读取失败"), current?.message ?? t("正在读取…"), "failed");
+      return null;
+    }
+    if ((current.settings.relayCommonConfigContents || "") !== original) {
+      showNotice(t("通用配置文件"), t("供应商配置已变更。请保留需要的草稿，再返回列表重新打开。"), "failed");
+      return null;
+    }
+    const result = await run(() => call<SettingsResult>("save_settings", {
+      settings: { ...current.settings, relayCommonConfigContents: text },
+    }));
+    if (!result || !isSuccessStatus(result.status)) {
+      if (result) showNotice(t("设置保存"), result.message, result.status);
+      return null;
+    }
+    acceptExternalSettings(result);
+    return normalizeSettings(result.settings);
+  };
+
   // 网关改了 Codex 的直连设置（接入 / 断开网关），或在 Codex 设置页改了开关：
   // 重新读取并把尚未保存的编辑叠上去，免得用旧设置整份写回或撞上 revision 冲突。
   useEffect(() => {
@@ -4634,12 +4702,7 @@ export function App() {
         return;
       }
       if (disposed || !isSuccessStatus(result.status)) return;
-      const previous = settingsRef.current?.settings;
-      const latest = normalizeSettings(result.settings);
-      setSettings(result);
-      setSettingsForm((current) => (previous
-        ? rebaseSettingsEdits(normalizeSettings(current), normalizeSettings(previous), latest)
-        : latest));
+      acceptExternalSettings(result);
     };
     void listen("codex-plus-settings-changed", () => {
       if (!disposed) void syncExternalSettings();
@@ -4764,6 +4827,7 @@ export function App() {
       performUpdate,
       saveSettings,
       saveSettingsValue,
+      saveCommonTemplate,
       autoSaveSettings,
       previewSettingsForm: (next: BackendSettings) => setSettingsForm(normalizeSettings(next)),
       refreshSettings,
@@ -5238,10 +5302,7 @@ export function App() {
               const currentSettings = await run(() => call<SettingsResult>("load_settings"));
               if (!currentApp || !currentSettings || !isSuccessStatus(currentApp.status) || !isSuccessStatus(currentSettings.status)) return false;
               setOverview(currentApp);
-              const fresh = normalizeSettings(currentSettings.settings);
-              const previous = normalizeSettings(settingsRef.current?.settings ?? currentSettings.settings);
-              setSettings(currentSettings);
-              setSettingsForm((current) => rebaseSettingsEdits(normalizeSettings(current), previous, fresh));
+              acceptExternalSettings(currentSettings);
               return currentApp.codex_app.status === "found" && hasCodexEnhancements(currentSettings);
             }}
             onLaunch={() => codexAppRunning ? restart() : launch()}
@@ -5250,9 +5311,9 @@ export function App() {
         ) : null;
 
   return (
-    <OpenAgentConfig.Provider value={(target, openPage) => {
-      if (openPage) void navigate("gateway");
-      setConfigTarget(target);
+    <OpenAgentConfig.Provider value={target => {
+      if (target.agent === "codex") setRelayCommonOpen(true);
+      else setConfigTarget(target);
     }}>
     <div className={`shell ${theme}`}>
       <AppSidebar
@@ -5319,7 +5380,11 @@ export function App() {
       ) : null}
       {tourOpen && !agentFocusOpen ? <OnboardingTour focus={agentFocus} onClose={closeTour} /> : null}
       <main className="workspace">
+        {relayCommonOpen ? (
+          <RelayCommonConfigScreen settings={settings} actions={actions} onBack={() => setRelayCommonOpen(false)} />
+        ) : null}
         <section
+          style={relayCommonOpen ? { display: "none" } : undefined}
           className={`screen ${isManagementScreen ? "management-screen" : ""} ${route === "requestLog" ? "request-log-screen" : ""}`.trim()}
           data-settings-mode={settingsModeRoutes.has(route) ? "true" : undefined}
           key={route}
@@ -5896,6 +5961,7 @@ type Actions = {
   performUpdate: () => Promise<void>;
   saveSettings: () => Promise<void>;
   saveSettingsValue: (settings: BackendSettings, silent?: boolean) => Promise<BackendSettings | null>;
+  saveCommonTemplate: (original: string, text: string) => Promise<BackendSettings | null>;
   autoSaveSettings: (settings: BackendSettings) => Promise<AutoSaveOutcome>;
   /// 乐观写入表单（不落盘）：拖拽排序松手时先让列表立即重排，落位动画才连贯。
   previewSettingsForm: (settings: BackendSettings) => void;
@@ -5972,7 +6038,7 @@ type Actions = {
   deleteContextEntry: (settings: BackendSettings, kind: ContextKind, id: string) => Promise<BackendSettings | null>;
   previewMcpServersJson: (json: string) => Promise<McpImportPreviewResult | null>;
   importMcpServersJson: (settings: BackendSettings, json: string) => Promise<BackendSettings | null>;
-  extractRelayCommonConfig: (configContents: string) => Promise<ExtractRelayCommonConfigResult | null>;
+  extractRelayCommonConfig: (configContents: string, contextConfigContents: string) => Promise<ExtractRelayCommonConfigResult | null>;
   testRelayProfile: (profile: RelayProfile) => Promise<void>;
   diagnoseRelayProfile: (profile: RelayProfile) => Promise<ProviderDoctorResult | null>;
   fetchRelayProfileModels: (profile: RelayProfile) => Promise<string[] | null>;
@@ -8153,6 +8219,7 @@ function RelayScreen({
   if (detailProfile) {
     return (
       <RelayProfileDetail
+        key={detailProfile.id}
         profile={detailProfile}
         relayFiles={!isNewProfile && detailProfile.id === normalized.activeRelayId ? relayFiles : null}
         form={normalized}
@@ -8346,7 +8413,6 @@ function RelayScreen({
         )}
       />
       {connection}
-      <AgentConfigButton agent="codex" name="Codex" navigate />
       <NativeAuthControl onRestart={() => actions.restart()} />
       <EnvConflictNotice envConflicts={envConflicts} actions={actions} />
       <SshRemoteLoopbackNotice notice={envConflicts?.sshRemoteLoopback ?? null} />
@@ -8547,6 +8613,7 @@ function CodexMultiLaunchScreen({
   if (detailProfile) {
     return (
       <RelayProfileDetail
+        key={detailProfile.id}
         profile={detailProfile}
         relayFiles={detailProfile.id === normalized.activeRelayId ? relayFiles : null}
         form={normalized}
@@ -8580,7 +8647,6 @@ function CodexMultiLaunchScreen({
           </button>
         )}
       />
-      <AgentConfigButton agent="codex" name="Codex" navigate />
       <CxSection count={instances.length} title={t("运行中的实例")}>
         <CxCard className="multi-launch-running-panel">
           {instances.length ? instances.map((instance) => {
@@ -12029,10 +12095,18 @@ function RelayProfileDetail({
 }) {
   const detailBodyRef = useRef<HTMLDivElement>(null);
   const [draft, setDraft] = useState<RelayProfile>(profile);
+  const common = useRelayCommonConfig(form.relayCommonConfigContents, actions);
+  const openedConfig = useRef(profile.configContents);
+  const liveDraftCommon = useRef<string | null>(null);
+  const configChanged = openedConfig.current !== profile.configContents
+    || (liveDraftCommon.current !== null && liveDraftCommon.current !== form.relayCommonConfigContents);
   const [modelWindowRows, setModelWindowRows] = useState<SortableModelWindowRow[]>(() =>
     modelWindowRowsFromProfile(profile.modelList, profile.modelWindows || "", profile.modelVlm, profile.modelAutoCompact)
       .map((row) => withModelRowSortId(row)),
   );
+  const loadedDraft = useRef({ profile: draft, rows: modelWindowRows });
+  const providerDirty = (draft !== loadedDraft.current.profile && JSON.stringify(draft) !== JSON.stringify(loadedDraft.current.profile))
+    || (modelWindowRows !== loadedDraft.current.rows && JSON.stringify(modelWindowRows) !== JSON.stringify(loadedDraft.current.rows));
   const [doctorResult, setDoctorResult] = useState<ProviderDoctorResult | null>(null);
   const [doctorOpen, setDoctorOpen] = useState(false);
   const [doctorRunning, setDoctorRunning] = useState(false);
@@ -12054,7 +12128,10 @@ function RelayProfileDetail({
   const unsavedRowEditsRef = useRef(false);
   const lastDetailProfileIdRef = useRef(profile.id);
   useEffect(() => {
+    if (configChanged && lastDetailProfileIdRef.current === profile.id) return;
+    openedConfig.current = profile.configContents;
     const useLiveFiles = isActive && profileUsesLiveFiles && relayFiles;
+    liveDraftCommon.current = useLiveFiles ? form.relayCommonConfigContents : null;
     const liveDraft = isAggregateRelayProfile(profile)
       ? normalizeAggregateRelayProfile(profile, form)
       : deriveRelayProfileFromFiles(
@@ -12070,18 +12147,21 @@ function RelayProfileDetail({
     const nextDraft = useLiveFiles && !isAggregateRelayProfile(liveDraft)
       ? applyRelayProfilePatchToFiles(liveDraft, { apiKey: storedApiKey })
       : liveDraft;
+    loadedDraft.current.profile = nextDraft;
     setDraft(nextDraft);
     const switchedProfile = lastDetailProfileIdRef.current !== profile.id;
     lastDetailProfileIdRef.current = profile.id;
     if (switchedProfile || !unsavedRowEditsRef.current) {
-      setModelWindowRows(modelWindowRowsFromProfile(nextDraft.modelList, nextDraft.modelWindows || "", nextDraft.modelVlm, nextDraft.modelAutoCompact)
-        .map((row) => withModelRowSortId(row)));
+      const rows = modelWindowRowsFromProfile(nextDraft.modelList, nextDraft.modelWindows || "", nextDraft.modelVlm, nextDraft.modelAutoCompact)
+        .map((row) => withModelRowSortId(row));
+      loadedDraft.current.rows = rows;
+      setModelWindowRows(rows);
     }
     // 依赖里刻意不放 profile.modelMetadata / 原始 relayFiles：元数据改动是本编辑器自己触发的
     // （删行会清该模型元数据），把它当依赖会让「删行 → 清元数据 → 重建行」把删掉的行加回来。
   }, [profile.id, profile.modelList, profile.modelWindows, profile.modelAutoCompact, profile.modelVlm, profileUsesLiveFiles, isActive, isNew, liveConfigContents, liveAuthContents]);
   const validationSettings = relaySettingsWithDraft(form, profile.id, draft, isNew);
-  const validationError = relaySessionProviderValidation(draft)
+  const validationError = configChanged || common.conflict ? t("供应商配置已变更。请保留需要的草稿，再返回列表重新打开。") : relaySessionProviderValidation(draft)
     ?? (isAggregateRelayProfile(draft)
       ? aggregateRelayProfileValidation(draft)
       : relayModelRoutesSettingsValidation(validationSettings));
@@ -12119,6 +12199,13 @@ function RelayProfileDetail({
   unsavedRowEditsRef.current = hasUnsavedModelChanges;
   const saveDraft = async () => {
     if (savingDraft) return;
+    if (!isNew && common.dirty && !providerDirty && !common.conflict) {
+      setSavingDraft(true);
+      try {
+        if (await common.save()) onSaved?.();
+      } finally { setSavingDraft(false); }
+      return;
+    }
     // 配置有误不再静默 return：把原因弹出来（按钮也不再因此禁用，见头部那一行提示）。
     if (isNew && isAggregateRelayProfile(draft) && aggregateMode === null) {
       void actions.showMessage(t("保存供应商"), t("先选择聚合类型（模型聚合 / 故障转移）再保存。"), "failed");
@@ -12149,7 +12236,7 @@ function RelayProfileDetail({
       if (requiresRestart && !(await appConfirm(t("此请求设置需要启动本地协议代理。保存后将立即重启 Codex，使设置安全生效。是否继续？"), { title: t("需要重启 Codex"), confirmText: t("保存并重启") }))) {
         return;
       }
-      const savedSettings = await onFormChange(next);
+      const savedSettings = await common.save(contents => onFormChange({ ...next, relayCommonConfigContents: contents }));
       if (!savedSettings) return;
       if (requiresRestart) {
         const restarted = await actions.restart(true);
@@ -12168,7 +12255,7 @@ function RelayProfileDetail({
     }
   };
   const switchDraft = () => {
-    if (isNew || validationError || modelRowsError) return;
+    if (isNew || common.dirty || validationError || modelRowsError) return;
     const draftWithWindows = draftWithModelRows();
     const normalizedDraft = isAggregateRelayProfile(draftWithWindows) ? normalizeAggregateRelayProfile(draftWithWindows, form) : deriveRelayProfileFromFiles(draftWithWindows);
     const previousActiveRelayId = form.activeRelayId;
@@ -12237,7 +12324,7 @@ function RelayProfileDetail({
           ) : isNew || form.activeRelayId === CODEX_GATEWAY_RELAY_ID ? null : (
             // 网关接管期间（从多开页进来编辑）不给「设为当前」：切走会绕过「断开并还原」（#2801）。
             <Button
-              disabled={actions.relaySwitching}
+              disabled={actions.relaySwitching || common.dirty}
               onClick={switchDraft}
               title={!form.relayProfilesEnabled ? t("供应商配置总开关已关闭，点击后按提示开启") : actions.relaySwitching ? t("供应商切换中") : undefined}
               variant={draft.id === form.activeRelayId ? "secondary" : "default"}
@@ -12283,6 +12370,10 @@ function RelayProfileDetail({
         )}
         {isAggregateRelayProfile(draft) ? null : (
         <RelayFileEditors
+          configChanged={configChanged || common.dirty || providerDirty || isNew || savingDraft}
+          saving={savingDraft}
+          commonContents={common.contents}
+          onCommonChange={common.change}
           contextProfile={profile}
           profile={draft}
           form={form}
@@ -15024,10 +15115,12 @@ function SyncedTextarea({
   value,
   onValueChange,
   className,
+  placeholder,
 }: {
   value: string;
   onValueChange: (value: string) => void;
   className?: string;
+  placeholder?: string;
 }) {
   const [localValue, setLocalValue] = useState(value);
   const isFocusedRef = useRef(false);
@@ -15043,6 +15136,7 @@ function SyncedTextarea({
   return (
     <Textarea
       className={className}
+      placeholder={placeholder}
       value={localValue}
       onBlur={() => {
         isFocusedRef.current = false;
@@ -15061,7 +15155,67 @@ function SyncedTextarea({
   );
 }
 
+function useRelayCommonConfig(original: string, actions: Actions) {
+  const [edit, setEdit] = useState<{ original: string; text: string } | null>(null);
+  const conflict = edit !== null && edit.original !== original;
+  return {
+    contents: edit?.text ?? original,
+    dirty: edit !== null,
+    conflict,
+    change: (text: string) => setEdit(previous => text === original ? null : { original: previous?.original ?? original, text }),
+    save: async (submitProfile?: (contents: string) => Promise<BackendSettings | null>) => {
+      if (conflict) return null;
+      const saved = submitProfile ? await submitProfile(edit?.text ?? original)
+        : edit ? await actions.saveCommonTemplate(edit.original, edit.text) : null;
+      if (saved && edit) {
+        setEdit(null);
+        await actions.showMessage(t("通用配置文件"), t("已保存。重新应用或切换到使用通用配置的供应商后生效。"), "ok");
+      }
+      return saved;
+    },
+  };
+}
+
+function RelayCommonConfigEditor({ contents, onChange, children }: {
+  contents: string; onChange: (text: string) => void; children?: ReactNode;
+}) {
+  return <>
+    <p className="relay-fold-description">{t("只保留非 MCP、插件的跨供应商配置；MCP&插件在独立页面管理。")}</p>
+    {children}
+    <SyncedTextarea className="relay-file-textarea" value={contents} onValueChange={onChange} placeholder={'model_verbosity = "low"'} />
+  </>;
+}
+
+function RelayCommonConfigScreen({ settings, actions, onBack }: { settings: SettingsResult | null; actions: Actions; onBack: () => void }) {
+  const form = settings && isSuccessStatus(settings.status) ? normalizeSettings(settings.settings) : null;
+  const common = useRelayCommonConfig(form?.relayCommonConfigContents ?? "", actions);
+  const [saving, setSaving] = useState(false);
+  const save = async () => {
+    setSaving(true);
+    try {
+      await common.save();
+    } finally { setSaving(false); }
+  };
+  return <section className="screen management-screen">
+    <header className="cx-page-head" data-tauri-drag-region="deep">
+      <div className="cx-page-title"><h1>{t("通用配置文件")}</h1></div>
+      <div className="topbar-actions">
+        <Button variant="ghost" onClick={onBack}>{t("返回列表")}</Button>
+        <Button disabled={!form || saving || !common.dirty || common.conflict} onClick={() => void save()}>{t("保存")}</Button>
+      </div>
+    </header>
+    {form ? <fieldset className="relay-common-config-body" disabled={saving}>
+      <RelayCommonConfigEditor contents={common.contents} onChange={common.change} />
+      {common.conflict ? <p role="alert">{t("供应商配置已变更。请保留需要的草稿，再返回列表重新打开。")}</p> : null}
+    </fieldset> : <p role={settings ? "alert" : "status"}>{settings?.message ?? t("正在读取…")}</p>}
+  </section>;
+}
+
 function RelayFileEditors({
+  configChanged,
+  saving,
+  commonContents,
+  onCommonChange,
   contextProfile,
   profile,
   form,
@@ -15071,19 +15225,24 @@ function RelayFileEditors({
   onProfileChange,
   actions,
 }: {
+  configChanged: boolean;
+  saving: boolean;
+  commonContents: string;
+  onCommonChange: (value: string) => void;
   contextProfile: RelayProfile;
   profile: RelayProfile;
   form: BackendSettings;
   isActive: boolean;
   profileId: string;
-  onFormChange: (value: BackendSettings) => void;
+  onFormChange: (value: BackendSettings) => Promise<BackendSettings | null>;
   onProfileChange: (value: RelayProfile) => void;
   actions: Actions;
 }) {
-  const configPreview = effectiveRelayConfigPreview(profile, form, contextProfile);
+  const draftSettings = { ...form, relayCommonConfigContents: commonContents };
+  const configPreview = effectiveRelayConfigPreview(profile, draftSettings, contextProfile);
   const entries = contextEntriesForProfile(form, contextProfile);
   return (
-    <div className="relay-file-grid">
+    <fieldset className="relay-file-grid" disabled={saving}>
       <RelayFold className="relay-file-panel relay-config-preview" sectionId="config-preview" title={t("config.toml 预览")}>
         <p className="relay-fold-description">
           {isActive ? t("当前供应商切换后会写入的预览；上下文开关变化会立即反映") : t("切换到此供应商时会写入的预览；上下文开关变化会立即反映")}
@@ -15094,7 +15253,7 @@ function RelayFileEditors({
           onValueChange={(value) => {
             const withoutCommon = stripCommonConfigTextFallback(
               value,
-              relayCombinedCommonConfig(form),
+              relayCombinedCommonConfig(draftSettings),
             );
             const configContents = stripContextEntriesFromConfig(withoutCommon, entries);
             onProfileChange(deriveRelayProfileFromFiles({
@@ -15111,15 +15270,14 @@ function RelayFileEditors({
         sectionId="common-config"
         title={t("通用配置文件")}
       >
-        <p className="relay-fold-description">
-          {t("跨供应商的用户设置保存在 Codex 通用配置中。")}
-        </p>
+        <RelayCommonConfigEditor contents={commonContents} onChange={onCommonChange}>
             <Button
+              disabled={configChanged}
               onClick={async () => {
-                const extracted = await actions.extractRelayCommonConfig(profile.configContents || "");
+                const extracted = await actions.extractRelayCommonConfig(profile.configContents || "", form.relayContextConfigContents);
                 if (!extracted) return;
-                const split = splitContextConfigText(extracted.commonConfigContents || "");
-                if (!split.common.trim() && !split.context.trim()) {
+                const { commonConfigContents, contextConfigContents } = extracted;
+                if (!commonConfigContents.trim() && !contextConfigContents.trim()) {
                   await actions.showMessage(t("通用配置文件"), t("当前供应商 config.toml 里没有可提取的通用配置。"), "failed");
                   return;
                 }
@@ -15129,13 +15287,14 @@ function RelayFileEditors({
                 };
                 const next = syncLegacyRelayFields({
                   ...form,
-                  relayCommonConfigContents: split.common,
-                  relayContextConfigContents: joinTomlSectionsRootFirst([form.relayContextConfigContents || "", split.context]),
+                  relayCommonConfigContents: commonConfigContents || form.relayCommonConfigContents,
+                  relayContextConfigContents: contextConfigContents || form.relayContextConfigContents,
                   relayProfiles: form.relayProfiles.map((item) => (item.id === profileId ? promotedProfile : item)),
                 });
-                onFormChange(next);
-                onProfileChange(promotedProfile);
-                await actions.saveSettingsValue(next, false);
+                if (await onFormChange(next)) {
+                  onProfileChange(promotedProfile);
+                  await actions.showMessage(t("通用配置文件"), t("已保存。重新应用或切换到使用通用配置的供应商后生效。"), "ok");
+                }
               }}
               size="sm"
               type="button"
@@ -15144,7 +15303,7 @@ function RelayFileEditors({
               <Download className="h-4 w-4" />
               {t("提取当前供应商配置")}
             </Button>
-        <AgentConfigButton agent="codex" name="Codex" />
+        </RelayCommonConfigEditor>
       </RelayFold>
       <RelayFold className="relay-file-panel relay-auth-preview" defaultOpen sectionId="auth-preview" title="auth.json">
         <p className="relay-fold-description">
@@ -15160,7 +15319,7 @@ function RelayFileEditors({
           onValueChange={(value) => onProfileChange(deriveRelayProfileFromFiles({ ...profile, authContents: value }, "auth"))}
         />
       </RelayFold>
-    </div>
+    </fieldset>
   );
 }
 
@@ -18306,12 +18465,8 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
   const backendAggregates = new Map(
     (settings.aggregateRelayProfiles ?? []).map((aggregate) => [aggregate.id, aggregate] as const),
   );
-  const splitCommon = splitContextConfigText(settings.relayCommonConfigContents || "");
-  const relayCommonConfigContents = splitCommon.common;
-  const relayContextConfigContents = joinTomlSectionsRootFirst([
-    settings.relayContextConfigContents || "",
-    splitCommon.context,
-  ]);
+  const relayCommonConfigContents = settings.relayCommonConfigContents || "";
+  const relayContextConfigContents = settings.relayContextConfigContents || "";
   const defaultContextSelection = contextSelectionForAllEntries({
     ...settings,
     relayCommonConfigContents,

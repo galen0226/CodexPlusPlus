@@ -233,7 +233,7 @@ test("「Codex 连接」页顶部是连接方式（经网关 / 直连）：没�
   const app = functionSource("App");
   assert.match(app, /<LegacyRelayGatewayHint[\s\S]*onOpenGateway=\{\(\) => void navigate\("gatewayProviders"\)\}/);
   // 连接方式作为 connection 传进 RelayScreen，只在列表视图显示；旧版代理设置作为 advanced 收进同一页底部。
-  assert.match(app, /\{route === "relay" \|\| route === "relayEnvironment" \? \(\n\s*<RelayScreen/);
+  assert.match(app, /route === "relay" \|\| route === "relayEnvironment" \? \(\n\s*<RelayScreen/);
   assert.match(app, /connection=\{\(\n\s*<LegacyRelayGatewayHint/);
   assert.match(app, /advanced=\{\(\n\s*<ProxySettingsScreen/);
   assert.match(app, /advancedOpen=\{route === "relayEnvironment" \|\| relayAdvancedOpen\}/);
@@ -465,7 +465,7 @@ test("Codex 被网关接管时隐藏旧版供应商功能；总开关关闭时�
 test("多开页可以直接编辑、删除供应商：删除先查占用再二次确认，网关托管项不给入口（#2801）", () => {
   const screen = functionSource("CodexMultiLaunchScreen");
   // 编辑就地打开同一个供应商详情页，返回 / 保存后回到多开列表。
-  assert.match(screen, /<RelayProfileDetail\r?\n\s+profile=\{detailProfile\}/);
+  assert.match(screen, /<RelayProfileDetail\b[^>]*profile=\{detailProfile\}/);
   assert.match(screen, /onBack=\{\(\) => setDetailProfileId\(null\)\}/);
   assert.match(screen, /onClick=\{\(\) => setDetailProfileId\(profile\.id\)\}/);
   // 删除：先用旧版列表同一套占用检查，再提醒运行中的多开实例，最后危险确认。

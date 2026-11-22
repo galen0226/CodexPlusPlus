@@ -3169,7 +3169,6 @@ export const EN_PLAIN: Record<string, string> = {
   "编辑配置": "Edit configuration",
   "配置来源": "Configuration source",
   "配置只读": "Read-only configuration",
-  "跨供应商的用户设置保存在 Codex 通用配置中。": "User settings shared across providers are stored in the Codex common configuration.",
   "关闭窗口": "Close",
   "选择模型": "Pick a model",
   "搜索模型…": "Search models…",
@@ -3178,6 +3177,8 @@ export const EN_PLAIN: Record<string, string> = {
     "No model list yet — use the button on the left to fetch from upstream.",
   "应用通用配置": "Apply common config",
   "编辑通用配置": "Edit common config",
+  "供应商配置已变更。请保留需要的草稿，再返回列表重新打开。": "The provider configuration changed. Keep a copy of any edits you need, then return to the list and reopen the provider.",
+  "已保存。重新应用或切换到使用通用配置的供应商后生效。": "Saved. Reapply or switch to a provider that uses the common config for the changes to take effect.",
   "切换到此供应商时，会把通用配置合并进 config.toml。":
     "Switching to this provider merges the common config into config.toml.",
   "此供应商只写入自己的 config.toml，不合并通用配置。":

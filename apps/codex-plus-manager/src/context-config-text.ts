@@ -216,16 +216,6 @@ function relativeContextSubtableToAbsolute(line: string, tableName: string, id: 
   return `[${[tableName, id, ...path].map(tomlKey).join(".")}]`;
 }
 
-export function allContextConfigToml(entries: CodexContextEntries): string {
-  const sections: string[] = [];
-  for (const option of contextKindTables) {
-    for (const entry of dedupeContextEntryList(contextEntriesByKind(entries, option.kind))) {
-      sections.push(contextEntryToTomlSection(option.tableName, entry));
-    }
-  }
-  return ensureTrailingNewline(sections.join("\n\n"));
-}
-
 export function selectedContextConfigToml(entries: CodexContextEntries): string {
   const sections: string[] = [];
   for (const option of contextKindTables) {
@@ -242,14 +232,6 @@ export function contextEntriesFromConfig(configContents: string): CodexContextEn
     mcpServers: parseContextEntries(configContents, "mcp", "mcp_servers"),
     skills: parseContextEntries(configContents, "skill", "skills"),
     plugins: parseContextEntries(configContents, "plugin", "plugins"),
-  };
-}
-
-export function splitContextConfigText(configContents: string): { common: string; context: string } {
-  const entries = contextEntriesFromConfig(configContents);
-  return {
-    common: stripContextEntriesFromConfig(configContents, entries),
-    context: allContextConfigToml(entries),
   };
 }
 

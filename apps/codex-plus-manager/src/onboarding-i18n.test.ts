@@ -36,15 +36,9 @@ function checkKeys(keys: Keys) {
   }
 }
 
-test("Agent 配置编辑器的文案使用对应英文字典并保留占位符", () => {
+test("模式问卷、入门清单和 Agent 配置编辑器的状态、按钮和错误均有英文", () => {
   const keys = emptyKeys();
-  collectCalls(source("./AgentConfigEditor.tsx"), keys);
-  checkKeys(keys);
-});
-
-test("模式问卷与入门清单的所有状态、按钮和错误均有英文", () => {
-  const keys = emptyKeys();
-  for (const file of ["./AgentFocusDialog.tsx", "./OnboardingSetup.tsx", "./OnboardingTour.tsx"]) {
+  for (const file of ["./AgentFocusDialog.tsx", "./OnboardingSetup.tsx", "./OnboardingTour.tsx", "./AgentConfigEditor.tsx"]) {
     const tree = source(file);
     collectCalls(tree, keys);
     if (file === "./AgentFocusDialog.tsx") {

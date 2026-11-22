@@ -1066,16 +1066,7 @@ pub fn apply_relay_profile_with_preservation(
     proxy_port: u16,
     preserve_nonprovider: bool,
 ) -> anyhow::Result<RelayApplyResult> {
-    if !preserve_nonprovider {
-        return apply_relay_profile_to_home_with_switch_rules_and_proxy_port(home, profile, common, proxy_port);
-    }
-    let mut effective = profile.clone();
-    let config = if profile.use_common_config {
-        merge_common_config_into_config(&profile.config_contents, &prepare_common_config_for_apply(common)?)?
-    } else { profile.config_contents.clone() };
-    effective.config_contents = preserve_live_nonprovider_settings(home, &config)?;
-    effective.use_common_config = false;
-    apply_relay_profile_to_home_with_switch_rules_and_proxy_port(home, &effective, common, proxy_port)
+    apply_profile_with_fallback(home, profile, common, proxy_port, preserve_nonprovider, None)
 }
 
 /// 多开实例专用（issue #2794）：把纯 API 供应商整理成「只用供应商 Key」的形态。
@@ -1177,11 +1168,34 @@ pub fn apply_relay_profile_to_home_with_switch_rules_and_proxy_port(
     common_config_contents: &str,
     proxy_port: u16,
 ) -> anyhow::Result<RelayApplyResult> {
-    let resolved_profile = crate::native_auth::resolve_profile_credentials(profile)?;
-    let profile = &resolved_profile;
+    apply_profile_with_fallback(home, profile, common_config_contents, proxy_port, false, None)
+}
+
+pub(crate) fn apply_profile_with_fallback(
+    home: &Path,
+    profile: &RelayProfile,
+    common_config_contents: &str,
+    proxy_port: u16,
+    preserve_nonprovider: bool,
+    official_fallback: Option<&str>,
+) -> anyhow::Result<RelayApplyResult> {
+    let mut effective;
+    let profile = if preserve_nonprovider {
+        effective = profile.clone();
+        let config = if profile.use_common_config {
+            merge_common_config_into_config(&profile.config_contents, &prepare_common_config_for_apply(common_config_contents)?)?
+        } else { profile.config_contents.clone() };
+        effective.config_contents = preserve_live_nonprovider_settings(home, &config)?;
+        effective.use_common_config = false;
+        &effective
+    } else { profile };
+    let profile = &crate::native_auth::resolve_profile_credentials(profile)?;
     let previous_model = live_root_model(home);
-    let result =
-        apply_relay_profile_to_home_inner(home, profile, common_config_contents, proxy_port)?;
+    let result = if profile.relay_mode == RelayMode::Official && !profile.official_mix_api_key {
+        apply_official_profile_to_home(home, profile, common_config_contents, official_fallback)?
+    } else {
+        apply_relay_profile_to_home_inner(home, profile, common_config_contents, proxy_port)?
+    };
     if profile.id != crate::gateway::apply::CODEX_GATEWAY_RELAY_ID {
         if let Err(error) =
             repair_managed_session_provider_in_home(home, ManagedSessionProviderScan::LegacyRollouts)
@@ -1220,9 +1234,6 @@ fn apply_relay_profile_to_home_inner(
     common_config_contents: &str,
     proxy_port: u16,
 ) -> anyhow::Result<RelayApplyResult> {
-    if profile.relay_mode == RelayMode::Official && !profile.official_mix_api_key {
-        return apply_official_profile_to_home(home, profile, common_config_contents);
-    }
     let profile = align_profile_model_with_active_goal_thread(home, profile);
     let profile = &profile;
     let selected_common = if profile.use_common_config {
@@ -2217,10 +2228,11 @@ fn sanitize_official_profile_table(table: &mut dyn TableLike) {
     }
 }
 
-pub(crate) fn apply_official_profile_to_home(
+fn apply_official_profile_to_home(
     home: &Path,
     profile: &RelayProfile,
     common_config: &str,
+    fallback: Option<&str>,
 ) -> anyhow::Result<RelayApplyResult> {
     normalize_relay_profile_for_storage(&mut profile.clone())?;
     let auth = (!profile.auth_contents.trim().is_empty()).then_some(profile.auth_contents.as_str());
@@ -2235,7 +2247,7 @@ pub(crate) fn apply_official_profile_to_home(
     ]
     .iter()
     .any(|value| !value.trim().is_empty());
-    if profile.config_contents.trim().is_empty()
+    if fallback.is_none() && profile.config_contents.trim().is_empty()
         && (!profile.use_common_config || common_config.trim().is_empty())
         && !has_explicit_model_settings
     {
@@ -2243,7 +2255,10 @@ pub(crate) fn apply_official_profile_to_home(
         return clear_relay_config_to_home_with_auth(home, auth);
     }
     let snapshot = if profile.config_contents.trim().is_empty() {
-        read_optional_text(&home.join("config.toml"))?
+        match fallback {
+            Some(text) => text.to_owned(),
+            None => read_optional_text(&home.join("config.toml"))?,
+        }
     } else {
         profile.config_contents.clone()
     };
@@ -3107,10 +3122,7 @@ fn parse_toml_document(contents: &str) -> anyhow::Result<DocumentMut> {
     if contents.trim().is_empty() {
         Ok(DocumentMut::new())
     } else {
-        // 解析错误不带原文（那一行可能是 Key），只报行列。
-        contents.parse::<DocumentMut>().map_err(|error| {
-            crate::gateway::restore::toml_syntax_error("config.toml", contents, error.span())
-        })
+        crate::gateway::restore::parse_toml("config.toml", contents)
     }
 }
 
@@ -3213,6 +3225,104 @@ pub fn normalize_config_text(contents: &str) -> String {
     normalize_duplicate_toml_text(contents)
 }
 
+const CONTEXT_ROOTS: [&str; 3] = ["mcp_servers", "skills", "plugins"];
+
+/// 新草稿须在迁移或去重前验证，不能把重复键修成另一份可保存的配置。
+pub fn validate_shared_config_draft(contents: &str) -> anyhow::Result<()> {
+    let doc = crate::gateway::restore::parse_toml("通用配置", contents)?;
+    for key in CONTEXT_ROOTS {
+        anyhow::ensure!(!doc.contains_key(key), "{key} 由独立页面管理，不能写入通用配置");
+    }
+    Ok(())
+}
+
+/// 将完整 TOML 按根键拆成共享模板和独立管理的上下文。旧版重复表先按原规则修复。
+pub fn split_context_config_sections(contents: &str) -> (String, String) {
+    let normalized = normalize_duplicate_toml_text(contents);
+    let Ok(mut common) = parse_toml_document(&normalized) else {
+        // 无法整体修复的旧设置仍按原规则迁移可识别的段落；新草稿不会走到这里。
+        let (mut common, mut context) = (Vec::new(), Vec::new());
+        let mut in_context = false;
+        for line in contents.lines() {
+            let header = line.trim();
+            if header.starts_with('[') && header.ends_with(']') {
+                in_context = header.starts_with("[mcp_servers.")
+                    || header.starts_with("[skills.")
+                    || header.starts_with("[plugins.");
+            }
+            if in_context {
+                context.push(line);
+            } else {
+                common.push(line);
+            }
+        }
+        return (
+            normalize_config_text(&common.join("\n")),
+            normalize_config_text(&context.join("\n")),
+        );
+    };
+    if !CONTEXT_ROOTS.iter().any(|key| common.contains_key(key)) {
+        return (normalized, String::new());
+    }
+    let mut context = DocumentMut::new();
+    for key in CONTEXT_ROOTS {
+        if let Some((key, item)) = common.as_table_mut().remove_entry(key) {
+            context.as_table_mut().insert_formatted(&key, item);
+        }
+    }
+    if common.is_empty() {
+        context.set_trailing(common.trailing().clone());
+        return (String::new(), normalize_optional_toml(context));
+    }
+    (normalize_optional_toml(common), normalize_optional_toml(context))
+}
+
+/// 两份配置各自从根开始；直接拼文本会把后一份的根键放进前一份的最后一个表。
+pub fn join_config_sections(first: &str, second: &str) -> String {
+    if first.trim().is_empty() {
+        return normalize_config_text(second);
+    }
+    if second.trim().is_empty() {
+        return normalize_config_text(first);
+    }
+    let first = normalize_config_text(first);
+    let second = normalize_config_text(second);
+    let (Ok(mut doc), Ok(mut other)) = (parse_toml_document(&first), parse_toml_document(&second)) else {
+        return normalize_config_text(&format!("{first}\n{second}"));
+    };
+    // toml_edit 按原文表头序号输出。两份文档都从零计数，追加的数组表必须排在原有条目后面。
+    fn shift_positions(table: &mut Table, offset: usize) {
+        if let Some(position) = table.position() {
+            table.set_position(position + offset);
+        }
+        for (_, item) in table.iter_mut() {
+            match item {
+                Item::Table(child) => shift_positions(child, offset),
+                Item::ArrayOfTables(entries) => {
+                    for child in entries.iter_mut() {
+                        shift_positions(child, offset);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    shift_positions(other.as_table_mut(), first.lines().count());
+    for (key, item) in other.iter() {
+        if let Some(existing) = doc.get_mut(key) {
+            merge_toml_item(existing, item);
+        } else {
+            doc.as_table_mut().insert_formatted(other.key(key).unwrap(), item.clone());
+        }
+    }
+    doc.set_trailing(format!(
+        "{}{}",
+        doc.trailing().as_str().unwrap_or_default(),
+        other.trailing().as_str().unwrap_or_default(),
+    ));
+    normalize_optional_toml(doc)
+}
+
 /// 把可能含重复表头/重复根键的文本，折叠成一份合法、去重的 TOML。
 ///
 /// 历史实现是逐行文本去重：按表头整行字符串匹配，撞见第二次出现的 `[header]`
@@ -3230,6 +3340,13 @@ pub fn normalize_config_text(contents: &str) -> String {
 /// 任何一块解析失败就说明输入本身已经坏到不是逐块可解析的程度，退回历史的逐行
 /// 丢弃策略，不让这次修复反而让原本能跑的输入报错。
 fn normalize_duplicate_toml_text(contents: &str) -> String {
+    let contents = contents.trim_start_matches('\u{feff}');
+    if contents.trim().is_empty() {
+        return String::new();
+    }
+    if contents.parse::<DocumentMut>().is_ok() {
+        return ensure_trailing_newline(contents.to_string());
+    }
     match merge_duplicate_toml_blocks(contents) {
         Some(merged) => normalize_optional_toml(merged),
         None => normalize_duplicate_toml_text_line_fallback(contents),
@@ -7274,37 +7391,24 @@ fn ensure_trailing_newline(mut contents: String) -> String {
 }
 
 fn move_model_providers_before_profiles(contents: &str) -> String {
-    let lines = contents.lines().collect::<Vec<_>>();
-    let Some(provider_start) = lines
-        .iter()
-        .position(|line| line.trim_start().starts_with("[model_providers."))
-    else {
-        return ensure_trailing_newline(contents.to_string());
+    let Ok(mut doc) = parse_toml_document(contents) else {
+        return ensure_trailing_newline(contents.to_owned());
     };
-    let provider_end = lines[provider_start + 1..]
-        .iter()
-        .position(|line| line.trim_start().starts_with('['))
-        .map(|offset| provider_start + 1 + offset)
-        .unwrap_or(lines.len());
-    let Some(profile_start) = lines
-        .iter()
-        .position(|line| line.trim_start().starts_with("[profiles."))
-    else {
-        return ensure_trailing_newline(contents.to_string());
-    };
-    if provider_start < profile_start {
-        return ensure_trailing_newline(contents.to_string());
+    let first_profile = doc.get("profiles").and_then(Item::as_table).and_then(|profiles| {
+        profiles.iter().filter_map(|(_, item)| item.as_table()?.position()).min()
+    });
+    if let Some(position) = first_profile
+        && let Some(providers) = doc.get_mut("model_providers").and_then(Item::as_table_mut)
+    {
+        for (_, item) in providers.iter_mut() {
+            if let Some(provider) = item.as_table_mut()
+                && provider.position().is_some_and(|current| current > position)
+            {
+                provider.set_position(position.saturating_sub(1));
+            }
+        }
     }
-
-    let mut output = Vec::with_capacity(lines.len());
-    output.extend_from_slice(&lines[..profile_start]);
-    output.extend_from_slice(&lines[provider_start..provider_end]);
-    if output.last().is_some_and(|line| !line.trim().is_empty()) {
-        output.push("");
-    }
-    output.extend_from_slice(&lines[profile_start..provider_start]);
-    output.extend_from_slice(&lines[provider_end..]);
-    ensure_trailing_newline(output.join("\n"))
+    ensure_trailing_newline(doc.to_string())
 }
 
 fn auth_json_chatgpt_account_label(path: &Path) -> Option<Option<String>> {
@@ -8100,6 +8204,26 @@ cwd = \"/tmp\"
 
         assert_eq!(doc["mcp_servers"]["node_repl"]["command"].as_str(), Some("node"));
         assert_eq!(doc["mcp_servers"]["node_repl"]["cwd"].as_str(), Some("/tmp"));
+    }
+
+    #[test]
+    fn normalize_config_text_preserves_multiline_headers_during_provider_ordering() {
+        let text = r#"developer_instructions = """
+[profiles.fake]
+[model_providers.fake]
+[model_providers.fake]
+"""
+[profiles.work]
+description = "live"
+[model_providers.real] # reorder this table only
+base_url = "fixture"
+"#;
+        let original = text.parse::<toml::Table>().unwrap();
+        let normalized = normalize_config_text(text);
+        assert_eq!(normalized, text);
+        let ordered = move_model_providers_before_profiles(&normalized);
+        assert_eq!(ordered.parse::<toml::Table>().unwrap(), original);
+        assert!(ordered.find("[model_providers.real]").unwrap() < ordered.find("[profiles.work]").unwrap());
     }
 
     /// 重复根键：后写覆盖前写，与 TOML 对同名键重复赋值时的直觉一致。

@@ -1085,6 +1085,8 @@ pub struct BackendSettings {
     /// 读取快照的版本，只用于条件保存，不写入 settings.json。
     #[serde(rename = "revision", default, skip_serializing_if = "String::is_empty")]
     pub settings_revision: String,
+    #[serde(default, rename = "_relayTuningBackfill", skip_serializing)]
+    pub pending_tuning_backfill: Option<crate::session_tuning::PendingBackfill>,
     #[serde(default)]
     pub dictation: DictationSettings,
     #[serde(rename = "codexAppPath", default)]
@@ -1549,6 +1551,7 @@ impl Default for BackendSettings {
     fn default() -> Self {
         Self {
             settings_revision: String::new(),
+            pending_tuning_backfill: None,
             dictation: DictationSettings::default(),
             codex_app_path: String::new(),
             codex_app_auto_takeover: false,
@@ -2404,6 +2407,7 @@ pub fn normalize_codex_extra_args(args: &[String]) -> Vec<String> {
 #[derive(Debug, Clone)]
 pub struct SettingsStore {
     path: PathBuf,
+    tuning_backfill: Option<crate::session_tuning::PendingBackfill>,
 }
 
 struct SettingsFileLock(File);
@@ -2474,7 +2478,11 @@ impl Drop for SettingsNormalizeGuard {
 
 impl SettingsStore {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self { path, tuning_backfill: None }
+    }
+
+    pub(crate) fn with_tuning_backfill(&self, pending: crate::session_tuning::PendingBackfill) -> Self {
+        Self { path: self.path.clone(), tuning_backfill: Some(pending) }
     }
 
     /// 与设置提交串行绑定，不能让启动时加载的旧授权跨过后续撤销。
@@ -2657,6 +2665,9 @@ impl SettingsStore {
         next.remove("revision");
         // 完整表单不能擦除新版本或拓展写入的未知字段；profile 以稳定 ID 对齐。
         preserve_unknown_settings_fields(&mut next, &raw)?;
+        if let Some(pending) = &self.tuning_backfill {
+            pending.store_in(&mut next)?;
+        }
         next.remove("revision");
         update_weixin_outbound_revision(&mut next, &raw);
         serialize_settings_bounded(&Value::Object(next))
@@ -3771,14 +3782,10 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
     settings.ccs_db_path = settings.ccs_db_path.trim().to_string();
     settings.ccs_import_sources.retain(|id, _| settings.relay_profiles.iter().any(|profile| &profile.id == id));
     let (common, extracted_context) =
-        split_context_config_sections(&settings.relay_common_config_contents);
-    let context = join_config_sections(&[
-        settings.relay_context_config_contents.as_str(),
-        extracted_context.as_str(),
-    ]);
-    settings.relay_common_config_contents = crate::relay_config::normalize_config_text(&common);
+        crate::relay_config::split_context_config_sections(&settings.relay_common_config_contents);
+    settings.relay_common_config_contents = common;
     settings.relay_context_config_contents = crate::relay_config::strip_legacy_skill_tables(
-        &crate::relay_config::normalize_config_text(&context),
+        &crate::relay_config::join_config_sections(&settings.relay_context_config_contents, &extracted_context),
     );
     for profile in &mut settings.relay_profiles {
         let mut normalized = profile.clone();
@@ -3888,54 +3895,6 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
     // 都会经过，两边不会漂移。
     settings.sync_tool_shards();
     settings
-}
-
-fn split_context_config_sections(config: &str) -> (String, String) {
-    let mut common = Vec::new();
-    let mut context = Vec::new();
-    let mut in_context_table = false;
-
-    for line in config.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            in_context_table = is_context_table_header(trimmed);
-        }
-        if in_context_table {
-            context.push(line);
-        } else {
-            common.push(line);
-        }
-    }
-
-    (
-        normalize_text_config(common.join("\n")),
-        normalize_text_config(context.join("\n")),
-    )
-}
-
-fn is_context_table_header(header: &str) -> bool {
-    header.starts_with("[mcp_servers.")
-        || header.starts_with("[skills.")
-        || header.starts_with("[plugins.")
-}
-
-fn join_config_sections(sections: &[&str]) -> String {
-    let joined = sections
-        .iter()
-        .map(|section| section.trim())
-        .filter(|section| !section.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    normalize_text_config(joined)
-}
-
-fn normalize_text_config(contents: String) -> String {
-    let trimmed = contents.trim();
-    if trimmed.is_empty() {
-        String::new()
-    } else {
-        format!("{trimmed}\n")
-    }
 }
 
 /// 逐级解析软链接（最多 16 层，防环），返回最终目标路径；不是软链接时返回 None。
@@ -5825,6 +5784,54 @@ experimental_bearer_token = "sk-existing""#
                 .relay_context_config_contents
                 .contains("[plugins.\"superpowers@openai-curated\"]")
         );
+        assert_eq!(store.load().unwrap(), updated);
+    }
+
+    #[test]
+    fn settings_store_update_extracts_context_without_splitting_toml_values() {
+        let dir = temp_dir();
+        let store = SettingsStore::new(dir.join("settings.json"));
+        let template = r#"# shared
+developer_instructions = '''
+[mcp_servers.fake]
+example = 1
+example = 2
+[plugins.fake]
+'''
+"plugins.literal" = "common"
+"mcp_servers".new.command = "new" # dotted
+'plugins' = { 'a.b' = { enabled = true } } # inline
+["permissions".local] # common table
+description = "mine"
+[ "mcp_servers".quoted ] # real table
+command = "quoted"
+[[skills.config]]
+path = "/one"
+[[skills.config]]
+path = "/two"
+"#;
+        let updated = store.update(json!({
+            "relayCommonConfigContents": template,
+            "relayContextConfigContents": "[mcp_servers.old]\ncommand = 'old'\n[[skills.config]]\npath = '/old-one'\n[[skills.config]]\npath = '/old-two'\n",
+        })).unwrap();
+        let common = &updated.relay_common_config_contents;
+        let context = &updated.relay_context_config_contents;
+        let shared: toml::Table = common.parse().unwrap();
+        let original: toml::Table = template.parse().unwrap();
+        assert_eq!(shared["developer_instructions"], original["developer_instructions"]);
+        assert_eq!(shared["plugins.literal"], original["plugins.literal"]);
+        assert_eq!(shared["permissions"], original["permissions"]);
+        assert_eq!(shared.len(), 3);
+        assert!(common.contains("# shared") && common.contains("# common table"));
+        let combined: toml::Table = crate::relay_config::join_config_sections(common, context).parse().unwrap();
+        assert_eq!(combined["mcp_servers"]["old"]["command"].as_str(), Some("old"));
+        assert_eq!(combined["mcp_servers"]["new"], original["mcp_servers"]["new"]);
+        assert_eq!(combined["mcp_servers"]["quoted"], original["mcp_servers"]["quoted"]);
+        assert_eq!(combined["plugins"], original["plugins"]);
+        let paths: Vec<_> = combined["skills"]["config"].as_array().unwrap().iter()
+            .map(|entry| entry["path"].as_str().unwrap()).collect();
+        assert_eq!(paths, ["/old-one", "/old-two", "/one", "/two"]);
+        assert_eq!(combined["permissions"], original["permissions"]);
         assert_eq!(store.load().unwrap(), updated);
     }
 

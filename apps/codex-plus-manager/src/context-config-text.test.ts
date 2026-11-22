@@ -3,7 +3,6 @@ import { test } from "node:test";
 import {
   contextEntriesFromConfig,
   contextEntryToTomlSection,
-  splitContextConfigText,
   parseContextEntries,
   stripContextEntriesFromConfig,
 } from "./context-config-text.ts";
@@ -104,10 +103,7 @@ command = "gh-mcp"
 [mcp_servers.github.tools.search]
 approval_mode = "approve"
 `;
-  const split = splitContextConfigText(config);
-  assert.match(split.context, /\[mcp_servers\.github\.tools\.search\]/);
-  assert.doesNotMatch(split.context, /^\[tools\.search\]/m);
-  const entry = parseContextEntries(split.context, "mcp", "mcp_servers")[0];
+  const entry = parseContextEntries(config, "mcp", "mcp_servers")[0];
   assert.equal(contextEntryToTomlSection("mcp_servers", entry), `[mcp_servers.github]
 command = "gh-mcp"
 

@@ -705,6 +705,31 @@ fn save_with_catalog_publisher(
 ) -> anyhow::Result<String> {
     recover_pending_catalog_refresh(store, home)?;
     let previous = store.load()?;
+    if previous.relay_common_config_contents != next.relay_common_config_contents {
+        let draft = crate::gateway::restore::parse_toml("通用配置", &next.relay_common_config_contents)?;
+        // 损坏的旧模板不能作为继承证据；修正稿仍按一份全新的模板完整校验。
+        let old = previous.relay_common_config_contents.parse().unwrap_or_default();
+        crate::session_tuning::validate_common_fields(&old, &draft)?;
+        return crate::session_tuning::save_common(
+            store,
+            next.clone(),
+            &old,
+            draft,
+            Some(&previous),
+            &[],
+            |store, clean| save_catalog_settings(store, home, &previous, clean, publish),
+        );
+    }
+    save_catalog_settings(store, home, &previous, next, publish)
+}
+
+fn save_catalog_settings(
+    store: &SettingsStore,
+    home: &Path,
+    previous: &BackendSettings,
+    next: &BackendSettings,
+    publish: impl FnOnce(&Path, &[u8]) -> anyhow::Result<()>,
+) -> anyhow::Result<String> {
     let Some(aggregate) = active_model_aggregation(next) else {
         return store.save_versioned(next);
     };
@@ -1046,6 +1071,7 @@ mod tests {
     fn catalog_publication_failure_restores_settings_and_keeps_old_pointer() {
         let (_temp,store,home)=publication_fixture();let before=store.snapshot_raw_bytes().unwrap().unwrap();
         let config=std::fs::read(home.join("config.toml")).unwrap();let mut next=store.load().unwrap();next.relay_profiles[0].model_list.push_str("\nnew-fixture-model");
+        next.relay_common_config_contents = "tool_output_token_limit = 4096\n".into();
         let error=save_with_catalog_publisher(&store,&home,&next,|_,_|anyhow::bail!("injected publication failure")).unwrap_err();
         assert!(error.to_string().contains("发布失败"));assert_eq!(store.snapshot_raw_bytes().unwrap().unwrap(),before);
         assert_eq!(std::fs::read(home.join("config.toml")).unwrap(),config);
