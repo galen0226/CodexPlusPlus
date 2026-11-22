@@ -4,8 +4,9 @@ use std::path::Path;
 use anyhow::Context;
 
 use crate::relay_config::{
-    LiveEndpointChanged, RelayBackfillPolicy, backfill_relay_profile_from_home_with_common,
-    backfill_relay_profile_from_home_with_common_and_policy, relay_config_status_from_home,
+    RelayBackfillPolicy, backfill_relay_profile_from_home_with_common,
+    backfill_relay_profile_from_home_with_common_and_policy, is_live_endpoint_conflict,
+    relay_config_status_from_home,
 };
 use crate::settings::{BackendSettings, RelayMode, SettingsStore};
 
@@ -16,7 +17,7 @@ pub struct RelaySwitchResult {
     pub backup_path: Option<String>,
 }
 
-/// 切换前回填上一个供应商时，实时配置的 endpoint 已被外部改过（#2666）。
+/// 切换前回填上一个供应商时，实时配置的 endpoint 已被外部改过（#2666）或缺失（#3222）。
 /// 管理器据此弹窗让用户选择，`message` 保持原来的完整报错文案。
 #[derive(Debug)]
 pub struct LiveEndpointConflict {
@@ -91,15 +92,13 @@ pub fn switch_relay_profile_in_home_resolving_conflict(
     // 先补回被过滤掉的供应商，再做上一个供应商的回填：回填按 id 在列表里找
     // 「当前供应商」，子集请求里同样可能缺它（否则会误报「已不在配置列表中」）。
     restore_missing_saved_profiles(&mut selected_settings, &saved_settings);
-    let pending = saved_settings.pending_tuning_backfill.as_ref();
     let mut outcome = LiveConflictOutcome::default();
     if !previous_active_relay_id.trim().is_empty()
         && previous_active_relay_id != selected_settings.active_relay_id
     {
         match resolution {
             LiveConflictResolution::Stop => {
-                backfill_profile_before_switch(home, &mut selected_settings, previous_active_relay_id,
-                    &saved_settings, pending)?;
+                backfill_profile_before_switch(home, &mut selected_settings, previous_active_relay_id)?;
             }
             LiveConflictResolution::ImportAsNewProfile => {
                 outcome.imported_profile_id = Some(import_live_as_new_profile(
@@ -117,17 +116,12 @@ pub fn switch_relay_profile_in_home_resolving_conflict(
     }
     crate::codex_app_state::capture_app_state_snapshot_nonfatal(home, "relay_switch.before");
 
-    let switched_store;
-    let store = if pending.is_some() {
-        switched_store = store.with_tuning_backfill(Default::default());
-        &switched_store
-    } else { store };
     let committed_revision = store
         .save_versioned(&selected_settings)
         .context("保存供应商设置失败")?;
     let selected_settings = store.load().context("读取供应商设置失败")?;
 
-    match apply_selected_relay_profile(home, &selected_settings, &saved_settings, live_snapshot.config.as_deref()) {
+    match apply_selected_relay_profile(home, &selected_settings) {
         Ok(result) => {
             let result = (result, outcome);
             crate::codex_app_state::sync_app_state_after_provider_switch_nonfatal(
@@ -251,8 +245,6 @@ fn backfill_profile_before_switch(
     home: &Path,
     settings: &mut BackendSettings,
     previous_active_relay_id: &str,
-    saved: &BackendSettings,
-    pending: Option<&crate::session_tuning::PendingBackfill>,
 ) -> anyhow::Result<()> {
     // 确认属于另一个已保存供应商的 live 配置，不回填到旧 profile（共享 Key 也适用）。
     if crate::relay_config::live_config_matches_other_profile_in_home(
@@ -281,19 +273,12 @@ fn backfill_profile_before_switch(
         profile,
         &mut settings.relay_context_config_contents,
     )
-    .and_then(|()| {
-        if profile.use_common_config && let Some(record) = pending
-            && let Some(original) = saved.relay_profiles.iter().find(|item| item.id == profile.id)
-        {
-            record.reconcile(&profile.id, &original.config_contents, &mut profile.config_contents)?;
-        }
-        Ok(())
-    })
     .with_context(|| format!("回填当前供应商配置失败（供应商：{previous_active_relay_id}）"))
     .map_err(|error| {
         let message = format!("{error:#}");
-        // endpoint 被外部改过是用户能选择怎么处理的一类（#2666），保留类型交给管理器弹窗。
-        if error.chain().any(|cause| cause.is::<LiveEndpointChanged>()) {
+        // endpoint 被外部改过（#2666）或缺失（#3222）是用户能选择怎么处理的一类，
+        // 保留类型交给管理器弹窗；接入网关时据此先存原文再放弃回填。
+        if is_live_endpoint_conflict(&error) {
             anyhow::Error::new(LiveEndpointConflict {
                 profile_id: previous_active_relay_id.to_string(),
                 message,
@@ -342,28 +327,17 @@ fn import_live_as_new_profile(
 fn apply_selected_relay_profile(
     home: &Path,
     settings: &BackendSettings,
-    previous: &BackendSettings,
-    live_config: Option<&[u8]>,
 ) -> anyhow::Result<RelaySwitchResult> {
     let relay = settings.active_relay_profile();
     let common_config = relay_combined_common_config(settings);
-    let official = relay.relay_mode == RelayMode::Official && !relay.official_mix_api_key;
-    if !official {
-        validate_switch_profile_files(&relay)?;
-    }
-    let fallback = if official && relay.config_contents.trim().is_empty()
-        && let Some(record) = &previous.pending_tuning_backfill
-    {
-        let mut text = std::str::from_utf8(live_config.unwrap_or_default())?.to_owned();
-        record.reconcile(&previous.active_relay_id, "", &mut text)?;
-        Some(text)
+    let result = if relay.relay_mode == RelayMode::Official && !relay.official_mix_api_key {
+        crate::relay_config::apply_relay_profile_with_preservation(home, &relay, &common_config, crate::protocol_proxy::protocol_proxy_port(), settings.relay_preserve_nonprovider_settings)?
     } else {
-        None
+        validate_switch_profile_files(&relay)?;
+        crate::relay_config::apply_relay_profile_with_preservation(
+            home, &relay, &common_config, crate::protocol_proxy::protocol_proxy_port(), settings.relay_preserve_nonprovider_settings,
+        )?
     };
-    let result = crate::relay_config::apply_profile_with_fallback(
-        home, &relay, &common_config, crate::protocol_proxy::protocol_proxy_port(),
-        settings.relay_preserve_nonprovider_settings, fallback.as_deref(),
-    )?;
     let status = relay_config_status_from_home(home);
     if relay.relay_mode == RelayMode::PureApi && !status.configured {
         anyhow::bail!(
@@ -408,8 +382,16 @@ fn validate_switch_profile_files(profile: &crate::settings::RelayProfile) -> any
 }
 
 fn relay_combined_common_config(settings: &BackendSettings) -> String {
-    crate::relay_config::join_config_sections(
-        &settings.relay_common_config_contents,
-        &settings.relay_context_config_contents,
-    )
+    let sections = [
+        settings.relay_common_config_contents.trim(),
+        settings.relay_context_config_contents.trim(),
+    ]
+    .into_iter()
+    .filter(|section| !section.is_empty())
+    .collect::<Vec<_>>();
+    if sections.is_empty() {
+        String::new()
+    } else {
+        crate::relay_config::normalize_config_text(&format!("{}\n", sections.join("\n\n")))
+    }
 }

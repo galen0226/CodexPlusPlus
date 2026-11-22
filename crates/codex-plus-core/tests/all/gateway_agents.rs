@@ -48,6 +48,7 @@ fn fixture() -> Fixture {
             strip_image_generation_tool: None,
             subscription_policy: None,
             strip_responses_image_detail: None,
+            strip_responses_output_encrypted_content: None,
             disable_tool_search: None,
             custom_headers: None,
         },
@@ -95,18 +96,18 @@ fn snapshot(root: &std::path::Path) -> Vec<(String, Vec<u8>)> {
 #[test]
 fn editor_preserves_user_fields_through_gateway_refresh_and_disconnect() {
     use agents::editor::config;
-    for (id, first, changed, forbidden, expected) in [
+    for (id, first, changed, forbidden) in [
         (
             "pi", r#"{"theme":"light"}"#, r#"{"theme":"dark"}"#,
-            r#"{"defaultProvider":"override"}"#, serde_json::json!({"theme":"dark"}),
+            r#"{"defaultProvider":"override"}"#,
         ),
         (
             "opencode", r#"{"autoupdate":false}"#, r#"{"autoupdate":true}"#,
-            r#"{"provider":"override"}"#, serde_json::json!({"autoupdate":true}),
+            r#"{"provider":"override"}"#,
         ),
         (
             "jcode", "theme = 'light'", "theme = 'dark'",
-            "model = 'override'", serde_json::json!({"ui":{"theme":"dark"}}),
+            "model = 'override'",
         ),
     ] {
         let fixture = fixture();
@@ -114,17 +115,12 @@ fn editor_preserves_user_fields_through_gateway_refresh_and_disconnect() {
         let agent = ToolId::Unknown(id.to_owned());
         let spec = agents::spec(id).unwrap();
         let path = (spec.config_path)(&ctx.agent_env);
-        let bindings = ctx.gateway.load().unwrap().bindings;
         let initial = config(ctx, id, None).unwrap();
-        assert!(!path.exists());
         let saved = config(ctx, id, Some((&initial.snapshot, first))).unwrap();
-        assert_eq!(ctx.gateway.load().unwrap().bindings, bindings, "{id}");
         enable_binding(ctx, &agent, binding()).unwrap();
         let before = std::fs::read(&path).unwrap();
-        for invalid in ["[", forbidden] {
-            assert!(config(ctx, id, Some((&saved.snapshot, invalid))).is_err(), "{id}: {invalid}");
-            assert_eq!(std::fs::read(&path).unwrap(), before);
-        }
+        assert!(config(ctx, id, Some((&saved.snapshot, forbidden))).is_err(), "{id}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
         let bindings = ctx.gateway.load().unwrap().bindings;
         let edited = config(ctx, id, Some((&saved.snapshot, changed))).unwrap();
         assert!(config(ctx, id, Some((&saved.snapshot, first))).is_err(), "{id}: stale snapshot");
@@ -133,13 +129,7 @@ fn editor_preserves_user_fields_through_gateway_refresh_and_disconnect() {
         assert!(agents::connect::points_at_gateway(ctx, spec), "{id}");
         assert_eq!(config(ctx, id, None).unwrap().snapshot.contents, edited.snapshot.contents, "{id}");
         disable_binding(ctx, &BackendSettings::default(), &agent).unwrap();
-        let text = std::fs::read_to_string(path).unwrap();
-        let restored = if id == "jcode" {
-            serde_json::to_value(text.parse::<toml::Table>().unwrap()).unwrap()
-        } else {
-            agents::files::parse_jsonc(&text).unwrap()
-        };
-        assert_eq!(restored, expected, "{id}");
+        assert_eq!(config(ctx, id, None).unwrap().snapshot.contents, edited.snapshot.contents, "{id}");
     }
 }
 
@@ -150,7 +140,9 @@ fn editor_shows_resolved_read_only_sources_without_granting_writes() {
         ("hermes", "display:\n  skin: dark\n"),
         ("omp", "theme: dark\n"),
         ("openclaw", "{theme:'dark',}"),
+        ("openchamber", r#"{"version":1,"fields":{"theme":{"value":"dark","updatedAt":1}}}"#),
         ("stepcode", "theme = 'dark'\n"),
+        ("jetbrains-air", r#"{"agent_servers":{}}"#),
     ] {
         let fixture = fixture();
         let ctx = &fixture.ctx;
@@ -175,6 +167,9 @@ fn editor_shows_resolved_read_only_sources_without_granting_writes() {
             "{id}"
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), initial);
+        if id == "jetbrains-air" {
+            assert!(!path.with_file_name("codexplus-opencode.json").exists());
+        }
     }
 }
 
@@ -221,12 +216,9 @@ fn editor_opens_supported_adapters_without_connecting_or_creating_files() {
     let ctx = &fixture.ctx;
     let bindings = ctx.gateway.load().unwrap().bindings;
     assert!(agents::editor::config(ctx, "codex", None).is_err());
-    let old_snapshot = agents::editor::ConfigSnapshot {
-        source: "Codex++ · relayCommonConfigContents (TOML)".into(),
-        contents: ctx.settings.load().unwrap().relay_common_config_contents,
-    };
     let revision = ctx.settings.revision().unwrap();
-    assert!(agents::editor::config(ctx, "codex", Some((&old_snapshot, "personality = 'friendly'"))).is_err());
+    let codex = agents::editor::ConfigSnapshot { source: String::new(), contents: String::new() };
+    assert!(agents::editor::config(ctx, "codex", Some((&codex, "personality = 'friendly'"))).is_err());
     assert_eq!(ctx.settings.revision().unwrap(), revision);
     for id in agents::all().iter().map(|spec| spec.id).chain([
         "claude",
@@ -236,34 +228,9 @@ fn editor_opens_supported_adapters_without_connecting_or_creating_files() {
         let view =
             agents::editor::config(ctx, id, None).unwrap_or_else(|error| panic!("{id}: {error:#}"));
         assert!(!view.snapshot.source.is_empty(), "{id}");
-        if !view.editable {
-            assert!(agents::editor::config(ctx, id, Some((&view.snapshot, "{}"))).is_err());
-        }
     }
     assert_eq!(bindings, ctx.gateway.load().unwrap().bindings);
     assert_eq!(before, snapshot(&fixture.home));
-}
-
-#[test]
-fn openchamber_editor_changes_only_the_nested_preference_value() {
-    use agents::editor::config;
-    let fixture = fixture();
-    let ctx = &fixture.ctx;
-    let id = "openchamber";
-    let path = (agents::spec(id).unwrap().config_path)(&ctx.agent_env);
-    let original = r#"{"version":1,"fields":{"theme":{"value":"dark","updatedAt":1,"source":{"name":"user"}},"defaultModel":{"value":"fixture"}}}"#;
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, original).unwrap();
-    let view = config(ctx, id, None).unwrap();
-    assert!(!view.snapshot.contents.contains("defaultModel"));
-    assert!(config(ctx, id, Some((&view.snapshot, r#"{"defaultModel":"x"}"#))).is_err());
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
-    config(ctx, id, Some((&view.snapshot, r#"{"theme":"light"}"#))).unwrap();
-    let saved = agents::files::parse_jsonc(&std::fs::read_to_string(path).unwrap()).unwrap();
-    assert_eq!(saved["fields"]["theme"]["value"], "light");
-    assert_eq!(saved["fields"]["theme"]["source"], serde_json::json!({"name":"user"}));
-    assert!(saved["fields"]["theme"]["updatedAt"].as_u64().unwrap() > 1);
-    assert_eq!(saved["fields"]["defaultModel"]["value"], "fixture");
 }
 
 #[test]
@@ -274,9 +241,9 @@ fn editor_preserves_siblings_and_rejects_ambiguous_drafts() {
     for (id, original, updated, draft, invalid) in [
         (
             "jcode",
-            "[ui]\ntheme  =  'dark' # mine\n[provider]\nname = 'mine'\n",
-            "[ui]\ntheme  =  \"light\" # mine\n[provider]\nname = 'mine'\n",
-            "theme = 'light'",
+            "[display]\ntheme  =  'dark' # mine\n[provider]\nname = 'mine'\n",
+            "[display]\ntheme  =  \"light\" # mine\n[provider]\nname = 'mine'\n",
+            "theme = 'light' # draft only",
             "theme = 'a'\ntheme = 'b'",
         ),
         (

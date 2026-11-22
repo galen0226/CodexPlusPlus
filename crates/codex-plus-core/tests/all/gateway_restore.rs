@@ -52,6 +52,7 @@ fn fixture(port: u16) -> Fixture {
             strip_image_generation_tool: None,
             subscription_policy: None,
             strip_responses_image_detail: None,
+            strip_responses_output_encrypted_content: None,
             disable_tool_search: None,
             custom_headers: None,
         },
@@ -278,17 +279,6 @@ fn claude_disconnect_restores_live_config_that_matched_a_saved_provider() {
 
 /// 在直连模式里放一个 Responses 供应商并切过去。
 fn seed_codex_direct(ctx: &ApplyContext) {
-    let seeded = direct_settings();
-    codex_plus_core::relay_switch::switch_relay_profile_in_home(
-        &ctx.settings,
-        &ctx.codex_home,
-        seeded,
-        "",
-    )
-    .unwrap();
-}
-
-fn direct_settings() -> BackendSettings {
     let mut direct = codex_plus_core::provider_import::pool_relay_profile(
         "直连",
         "https://api.direct.test/v1",
@@ -306,209 +296,13 @@ fn direct_settings() -> BackendSettings {
     seeded.relay_profiles_enabled = true;
     seeded.relay_profiles = vec![direct];
     seeded.active_relay_id = "direct".into();
-    seeded
-}
-
-#[test]
-fn relay_inline_saves_the_shared_template_without_switching_provider() {
-    use codex_plus_core::aggregate_catalog::save_with_active_catalog_refresh;
-    let fixture = fixture(57417);
-    let ctx = &fixture.ctx;
-    seed_codex_direct(ctx);
-    let mut settings = ctx.settings.load().unwrap();
-    settings.relay_common_config_contents = codex_plus_core::relay_config::extract_common_config_from_config(
-        "model = 'direct'\n[permissions.local]\ndescription = 'work'\n[sandbox_workspace_write]\nnetwork_access = false\n",
+    codex_plus_core::relay_switch::switch_relay_profile_in_home(
+        &ctx.settings,
+        &ctx.codex_home,
+        seeded,
+        "",
     )
     .unwrap();
-    ctx.settings.save(&settings).unwrap();
-    let save = |next: &BackendSettings| {
-        save_with_active_catalog_refresh(&ctx.settings, &ctx.codex_home, next)
-    };
-    let mut next = ctx.settings.load().unwrap();
-    let live_before = read(&ctx.codex_home.join("config.toml"));
-    ctx.settings
-        .update(json!({"codexAppPath": "concurrent-app-path"}))
-        .unwrap();
-    let draft = next.relay_common_config_contents.replace("false", "true");
-    assert_ne!(draft, next.relay_common_config_contents);
-    next.relay_common_config_contents = draft.clone();
-    assert!(save(&next).is_err());
-    let mut next = ctx.settings.load().unwrap();
-    next.relay_common_config_contents = "[invalid".into();
-    assert!(save(&next).is_err());
-    assert_eq!(
-        ctx.settings.load().unwrap().relay_common_config_contents,
-        settings.relay_common_config_contents
-    );
-    next.relay_common_config_contents = draft;
-    save(&next).unwrap();
-    let saved = ctx.settings.load().unwrap();
-    assert_eq!(saved.codex_app_path, "concurrent-app-path");
-    let reopened: toml::Value = saved.relay_common_config_contents.parse().unwrap();
-    assert_eq!(
-        reopened["permissions"]["local"]["description"].as_str(),
-        Some("work")
-    );
-    assert_eq!(
-        reopened["sandbox_workspace_write"]["network_access"].as_bool(),
-        Some(true)
-    );
-    assert_eq!(read(&ctx.codex_home.join("config.toml")), live_before);
-    assert_eq!(saved.active_relay_id, settings.active_relay_id);
-    assert!(
-        ctx.gateway
-            .load()
-            .unwrap()
-            .binding(&ToolId::Codex)
-            .is_none()
-    );
-    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
-    let mut connected = ctx.settings.load().unwrap();
-    connected.relay_common_config_contents = "developer_instructions = 'connected note'".into();
-    save(&connected).unwrap();
-    assert_eq!(
-        codex_plus_core::gateway::apply::refresh_enabled(ctx).unwrap(),
-        1
-    );
-    let live = std::fs::read_to_string(ctx.codex_home.join("config.toml")).unwrap();
-    assert!(live.contains("connected note"));
-    disable_binding(ctx, &ctx.settings.load().unwrap(), &ToolId::Codex).unwrap();
-    assert!(
-        ctx.settings.load()
-            .unwrap()
-            .relay_common_config_contents
-            .contains("connected note")
-    );
-}
-
-#[test]
-fn relay_inline_template_save_survives_switching_back() {
-    for mode in ["direct", "official", "managed"] {
-        check_tuning_round_trip(mode);
-    }
-}
-
-fn check_tuning_round_trip(mode: &str) {
-    use codex_plus_core::relay_config::apply_relay_profile_to_home_with_switch_rules;
-    use codex_plus_core::relay_switch::switch_relay_profile_in_home;
-    let fixture = fixture(57419);
-    let ctx = &fixture.ctx;
-    let key = "tool_output_token_limit";
-    let mut settings = direct_settings();
-    let mut other = codex_plus_core::provider_import::pool_relay_profile(
-        "Other",
-        "https://api.other.test/v1",
-        "sk-other",
-        RelayProtocol::Responses,
-        "other",
-        "other",
-        &[],
-    )
-    .unwrap();
-    other.id = "other".into();
-    other.relay_mode = RelayMode::PureApi;
-    other.use_common_config = true;
-    settings.relay_profiles.push(other);
-    let active = &mut settings.relay_profiles[0];
-    if mode == "official" {
-        *active = RelayProfile {
-            id: "direct".into(),
-            relay_mode: RelayMode::Official,
-            config_contents: "model_verbosity = 'low'\n".into(),
-            ..RelayProfile::default()
-        };
-    } else if mode == "managed" {
-        active.protocol = RelayProtocol::ChatCompletions;
-    }
-    active.config_contents = format!("compact_prompt = 'private'\n{}", active.config_contents);
-    settings.relay_common_config_contents = format!("{key} = 4000\ncompact_prompt = 'shared'\ninclude_apps_instructions = true\n");
-    ctx.settings.save(&settings).unwrap();
-    let apply = |settings: &BackendSettings| apply_relay_profile_to_home_with_switch_rules(
-        &ctx.codex_home, &settings.active_relay_profile(), &settings.relay_common_config_contents,
-    );
-    apply(&settings).unwrap();
-    assert!(ctx.settings.load().unwrap().pending_tuning_backfill.is_none());
-    let live = || {
-        read(&ctx.codex_home.join("config.toml"))
-            .parse::<toml::Value>()
-            .unwrap()
-    };
-    assert_eq!(live()[key].as_integer(), Some(4000));
-    assert_eq!(live()["compact_prompt"].as_str(), Some("shared"));
-    if mode == "managed" {
-        assert!(read(&ctx.codex_home.join("config.toml")).contains("127.0.0.1"));
-    }
-    let save = |settings: &BackendSettings| {
-        codex_plus_core::aggregate_catalog::save_with_active_catalog_refresh(
-            &ctx.settings, &ctx.codex_home, settings,
-        ).unwrap()
-    };
-    let mut next = ctx.settings.load().unwrap();
-    next.relay_common_config_contents = next.relay_common_config_contents.replace("4000", "5000");
-    save(&next);
-    let next = ctx.settings.load().unwrap();
-    assert_eq!(live()[key].as_integer(), Some(4000));
-    assert!(next.pending_tuning_backfill.is_some());
-    if mode == "direct" {
-        use codex_plus_core::session_tuning::with_template_reapply;
-        let before = read(&ctx.codex_home.join("config.toml"));
-        let (_, rollback) = with_template_reapply(&ctx.settings, &next, || apply(&next)).unwrap();
-        rollback.unwrap().restore(|| {
-            std::fs::write(ctx.codex_home.join("config.toml"), &before)?;
-            Ok(())
-        }).unwrap();
-        assert_eq!(ctx.settings.load().unwrap().settings_revision, next.settings_revision);
-        with_template_reapply(&ctx.settings, &next, || apply(&next)).unwrap();
-        assert_eq!(live()[key].as_integer(), Some(5000));
-        assert!(ctx.settings.load().unwrap().pending_tuning_backfill.is_none());
-    }
-    let path = ctx.codex_home.join("config.toml");
-    let mut independent: toml_edit::DocumentMut = read(&path).parse().unwrap();
-    independent["include_apps_instructions"] = toml_edit::value(false);
-    std::fs::write(&path, independent.to_string()).unwrap();
-    let mut next = ctx.settings.load().unwrap();
-    if mode == "managed" {
-        independent.remove("compact_prompt");
-        std::fs::write(&path, independent.to_string()).unwrap();
-        codex_plus_core::session_tuning::write(&ctx.settings,
-            &json!({"edits":[{"key":"compact_prompt","value":null}]})).unwrap();
-        next = ctx.settings.load().unwrap();
-    }
-    next.relay_common_config_contents = "[permissions.work]\ndescription = 'work'\n[sandbox_workspace_write]\nnetwork_access = false".into();
-    next.relay_profiles[1].name = "Renamed".into();
-    save(&next);
-    let saved = ctx.settings.load().unwrap();
-    assert_eq!(saved.relay_profiles[1].name, "Renamed");
-    let template: toml::Value = saved.relay_common_config_contents.parse().unwrap();
-    assert_eq!(template["permissions"]["work"]["description"].as_str(), Some("work"));
-    assert_eq!(template["sandbox_workspace_write"]["network_access"].as_bool(), Some(false));
-    for (previous, next) in [("direct", "other"), ("other", "direct")] {
-        let mut settings = ctx.settings.load().unwrap();
-        settings.active_relay_id = next.into();
-        switch_relay_profile_in_home(&ctx.settings, &ctx.codex_home, settings, previous).unwrap();
-        assert!(ctx.settings.load().unwrap().pending_tuning_backfill.is_none());
-        assert!(
-            live().get(key).is_none(),
-            "{mode}/{next} restored a removed common value"
-        );
-        assert_eq!(live().get("compact_prompt").and_then(toml::Value::as_str),
-            (next == "direct").then_some("private"), "{mode}/{next}");
-        assert_eq!(live().get("include_apps_instructions").and_then(toml::Value::as_bool),
-            (next == "direct").then_some(false), "{mode}/{next}");
-    }
-    if mode == "official" {
-        let mut empty = ctx.settings.load().unwrap();
-        empty.relay_profiles[0].config_contents.clear();
-        empty.relay_common_config_contents = format!("{key} = 4000");
-        ctx.settings.save(&empty).unwrap();
-        std::fs::write(&path, format!("{key} = 4000")).unwrap();
-        let mut removed = ctx.settings.load().unwrap();
-        removed.relay_common_config_contents.clear();
-        save(&removed);
-        switch_relay_profile_in_home(&ctx.settings, &ctx.codex_home, ctx.settings.load().unwrap(), "direct").unwrap();
-        assert!(live().get(key).is_none());
-        assert!(ctx.settings.load().unwrap().pending_tuning_backfill.is_none());
-    }
 }
 
 fn append(path: &std::path::Path, text: &str) {
@@ -594,6 +388,67 @@ fn codex_disconnect_keeps_login_made_while_on_the_gateway() {
     disable_binding(ctx, &settings, &ToolId::Codex).unwrap();
     let auth: Value = serde_json::from_str(&read(&auth_path)).unwrap();
     assert_eq!(auth["tokens"]["access_token"], "at-new", "{auth}");
+}
+
+/// issue #3222：接入前的供应商在实时 config.toml 里找不到有效 endpoint 时，接入网关不能卡死：
+/// 先存原文再放弃回填，接入照常完成；接入前供应商的档案不被缺地址的实时配置写坏，断开后原文回来。
+fn assert_codex_connects_despite_missing_live_endpoint(ctx: &ApplyContext, broken_live: &str) {
+    let config_path = ctx.codex_home.join("config.toml");
+    let direct_before = ctx
+        .settings
+        .load()
+        .unwrap()
+        .relay_profiles
+        .into_iter()
+        .find(|profile| profile.id == "direct")
+        .unwrap();
+    std::fs::write(&config_path, broken_live).unwrap();
+
+    enable_binding(ctx, &ToolId::Codex, binding()).expect("live 缺 endpoint 不能挡住接入网关");
+
+    assert!(read(&config_path).contains("/gw/codex/v1"), "{}", read(&config_path));
+    let stash: Value =
+        serde_json::from_str(&read(&ctx.backup_root.join("codex-before-gateway.json")))
+            .expect("接入前的原文要存下来");
+    assert_eq!(stash["configToml"].as_str(), Some(broken_live), "{stash}");
+    let settings = ctx.settings.load().unwrap();
+    let direct = settings
+        .relay_profiles
+        .iter()
+        .find(|profile| profile.id == "direct")
+        .unwrap();
+    assert_eq!(direct.config_contents, direct_before.config_contents, "直连供应商的档案不能被回填写坏");
+    assert_eq!(direct.auth_contents, direct_before.auth_contents);
+    assert!(direct.config_contents.contains("https://api.direct.test/v1"));
+
+    disable_binding(ctx, &settings, &ToolId::Codex).unwrap();
+    let restored = read(&config_path);
+    assert!(!restored.contains("/gw/codex"), "{restored}");
+    assert_eq!(ctx.settings.load().unwrap().active_relay_id, "direct");
+}
+
+#[test]
+fn codex_connects_when_live_provider_section_lacks_base_url() {
+    let fixture = fixture(57440);
+    let ctx = &fixture.ctx;
+    seed_codex_direct(ctx);
+    let seeded = read(&ctx.codex_home.join("config.toml"));
+    let broken: String = seeded
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("base_url"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert!(!broken.contains("api.direct.test"), "{broken}");
+    assert_codex_connects_despite_missing_live_endpoint(ctx, &broken);
+}
+
+#[test]
+fn codex_connects_when_live_model_provider_points_at_missing_section() {
+    let fixture = fixture(57441);
+    let ctx = &fixture.ctx;
+    seed_codex_direct(ctx);
+    let broken = "model_provider = \"ghost\"\nmodel = \"gpt-direct\"\n";
+    assert_codex_connects_despite_missing_live_endpoint(ctx, broken);
 }
 
 /// 正常接入（直连模式能从自己的记录还原，没存副本）：接入期间加的 MCP 段断开后仍在。

@@ -73,6 +73,8 @@ pub struct RelayProfile {
     pub relay_mode: RelayMode,
     #[serde(rename = "officialMixApiKey", default)]
     pub official_mix_api_key: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inactive_mixed_api: Option<InactiveMixedApi>,
     /// 供应商引用的网关/账号凭证；留空时沿用供应商自己的 auth 快照。
     #[serde(rename = "officialAccountRef", default, skip_serializing_if = "String::is_empty")]
     pub official_account_ref: String,
@@ -99,7 +101,8 @@ pub struct RelayProfile {
     #[serde(
         rename = "modelWindows",
         default,
-        skip_serializing_if = "String::is_empty"
+        skip_serializing_if = "String::is_empty",
+        deserialize_with = "deserialize_json_text"
     )]
     pub model_windows: String,
     /// 每模型自动压缩百分比（JSON map: slug -> 百分比字符串，如 "90" 或 "90%"）。
@@ -107,17 +110,24 @@ pub struct RelayProfile {
     #[serde(
         rename = "modelAutoCompact",
         default,
-        skip_serializing_if = "String::is_empty"
+        skip_serializing_if = "String::is_empty",
+        deserialize_with = "deserialize_json_text"
     )]
     pub model_auto_compact: String,
     /// 每模型元数据覆盖（JSON map: slug -> 字段覆盖）。
     #[serde(
         rename = "modelMetadata",
         default,
-        skip_serializing_if = "String::is_empty"
+        skip_serializing_if = "String::is_empty",
+        deserialize_with = "deserialize_json_text"
     )]
     pub model_metadata: String,
-    #[serde(rename = "modelVlm", default, skip_serializing_if = "String::is_empty")]
+    #[serde(
+        rename = "modelVlm",
+        default,
+        skip_serializing_if = "String::is_empty",
+        deserialize_with = "deserialize_json_text"
+    )]
     pub model_vlm: String,
     #[serde(
         rename = "vlmApiKey",
@@ -186,6 +196,11 @@ pub struct RelayProfile {
     /// OpenAI 扩展字段，只会返回泛化的 invalid_request（#2870）。
     #[serde(default, skip_serializing_if = "is_false")]
     pub strip_responses_image_detail: bool,
+    /// 转发前移除 Responses 顶层 `include` 里的 `output.encrypted_content`。
+    /// 部分严格上游只接受 `reasoning.encrypted_content`，带上该项会整单 400。
+    /// 默认关闭；Kimi 等已知上游仍由自动识别处理。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub strip_responses_output_encrypted_content: bool,
     /// 不向该上游发送 `tool_search` 托管工具：部分第三方 Responses 上游不认识
     /// 它，供应商测试能过但实际聊天整单 400（#2868 / #2871）。Kimi 官方自动处理。
     #[serde(default, skip_serializing_if = "is_false")]
@@ -370,6 +385,15 @@ pub struct AggregateRelayProfile {
     pub auto_review_relay_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InactiveMixedApi {
+    pub config_contents: String,
+    pub upstream_base_url: String,
+    #[serde(default)]
+    pub model_routes: Vec<RelayModelRoute>,
+}
+
 impl Default for RelayProfile {
     fn default() -> Self {
         Self {
@@ -384,6 +408,7 @@ impl Default for RelayProfile {
             protocol: RelayProtocol::Responses,
             relay_mode: RelayMode::Official,
             official_mix_api_key: false,
+            inactive_mixed_api: None,
             official_account_ref: String::new(),
             no_auth: false,
             hide_official_usage_alert: false,
@@ -414,6 +439,7 @@ impl Default for RelayProfile {
             strict_responses_reasoning: false,
             strip_image_generation_tool: false,
             strip_responses_image_detail: false,
+            strip_responses_output_encrypted_content: false,
             disable_tool_search: false,
             pure_api_image_generation: false,
             auto_review_model: String::new(),
@@ -476,6 +502,15 @@ impl RelayProfile {
     /// 第三方 Responses 上游生效。
     pub fn strips_responses_image_detail(&self) -> bool {
         self.strip_responses_image_detail
+            && self.protocol == RelayProtocol::Responses
+            && self.relay_mode != RelayMode::Aggregate
+            && (self.relay_mode != RelayMode::Official || self.official_mix_api_key)
+    }
+
+    /// 是否在转发前移除 Responses 顶层 `include` 里的
+    /// `output.encrypted_content`；只对经本地代理转发的第三方 Responses 上游生效。
+    pub fn strips_responses_output_encrypted_content(&self) -> bool {
+        self.strip_responses_output_encrypted_content
             && self.protocol == RelayProtocol::Responses
             && self.relay_mode != RelayMode::Aggregate
             && (self.relay_mode != RelayMode::Official || self.official_mix_api_key)
@@ -1085,8 +1120,6 @@ pub struct BackendSettings {
     /// 读取快照的版本，只用于条件保存，不写入 settings.json。
     #[serde(rename = "revision", default, skip_serializing_if = "String::is_empty")]
     pub settings_revision: String,
-    #[serde(default, rename = "_relayTuningBackfill", skip_serializing)]
-    pub pending_tuning_backfill: Option<crate::session_tuning::PendingBackfill>,
     #[serde(default)]
     pub dictation: DictationSettings,
     #[serde(rename = "codexAppPath", default)]
@@ -1400,6 +1433,16 @@ pub struct BackendSettings {
     pub codex_app_dream_skin_theme_config: DreamSkinThemeConfig,
     #[serde(rename = "codexAppDreamSkinImagePath", default)]
     pub codex_app_dream_skin_image_path: String,
+    /// 皮肤面板透出壁纸的百分比（0–100，#3233）。是用户偏好，不写进主题包：
+    /// 注入时作为 `userTransparency` 并进交给上游渲染器的主题配置。
+    /// None 表示跟随主题（主题配色自带透明度就用它，否则上游默认透出 30%）。
+    #[serde(
+        rename = "codexAppDreamSkinUserTransparency",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_dream_skin_user_transparency"
+    )]
+    pub codex_app_dream_skin_user_transparency: Option<u8>,
     #[serde(rename = "codexGoalsEnabled", default)]
     pub codex_goals_enabled: bool,
     #[serde(rename = "weixinConnectEnabled", default)]
@@ -1551,7 +1594,6 @@ impl Default for BackendSettings {
     fn default() -> Self {
         Self {
             settings_revision: String::new(),
-            pending_tuning_backfill: None,
             dictation: DictationSettings::default(),
             codex_app_path: String::new(),
             codex_app_auto_takeover: false,
@@ -1643,6 +1685,7 @@ impl Default for BackendSettings {
             codex_app_dream_skin_theme: default_dream_skin_theme(),
             codex_app_dream_skin_theme_config: DreamSkinThemeConfig::default(),
             codex_app_dream_skin_image_path: String::new(),
+            codex_app_dream_skin_user_transparency: None,
             codex_goals_enabled: false,
             weixin_connect_enabled: false,
             weixin_connect_base_url: default_weixin_connect_base_url(),
@@ -1721,6 +1764,7 @@ impl BackendSettings {
                 protocol: RelayProtocol::Responses,
                 relay_mode: RelayMode::MixedApi,
                 official_mix_api_key: true,
+                inactive_mixed_api: None,
                 official_account_ref: String::new(),
                 no_auth: false,
                 hide_official_usage_alert: false,
@@ -1751,6 +1795,7 @@ impl BackendSettings {
                 strict_responses_reasoning: false,
                 strip_image_generation_tool: false,
                 strip_responses_image_detail: false,
+                strip_responses_output_encrypted_content: false,
                 disable_tool_search: false,
                 pure_api_image_generation: false,
                 auto_review_model: String::new(),
@@ -1796,6 +1841,7 @@ impl BackendSettings {
             protocol: RelayProtocol::Responses,
             relay_mode: RelayMode::Official,
             official_mix_api_key: false,
+            inactive_mixed_api: None,
             official_account_ref: String::new(),
             no_auth: false,
             hide_official_usage_alert: false,
@@ -1826,6 +1872,7 @@ impl BackendSettings {
             strict_responses_reasoning: false,
             strip_image_generation_tool: false,
             strip_responses_image_detail: false,
+            strip_responses_output_encrypted_content: false,
             disable_tool_search: false,
             pure_api_image_generation: false,
             auto_review_model: String::new(),
@@ -1899,6 +1946,7 @@ impl BackendSettings {
             || self.active_relay_profile().strips_image_generation_tool()
             || self.active_relay_profile().enables_pure_api_image_generation()
             || self.active_relay_profile().strips_responses_image_detail()
+            || self.active_relay_profile().strips_responses_output_encrypted_content()
     }
 
     pub fn active_relay_uses_protocol_proxy(&self) -> bool {
@@ -2353,6 +2401,20 @@ where
         .unwrap_or_else(default_dream_skin_theme))
 }
 
+/// 皮肤「壁纸透出」偏好：数字取整并限制在 0–100；null 或不是数字都算跟随主题（None）。
+pub fn normalize_dream_skin_user_transparency(value: &Value) -> Option<u8> {
+    let number = value.as_f64().filter(|number| number.is_finite())?;
+    Some(number.round().clamp(0.0, 100.0) as u8)
+}
+
+/// 手改坏的值不能让整份设置读不出来：读不懂就当跟随主题。
+fn deserialize_dream_skin_user_transparency<'de, D>(deserializer: D) -> Result<Option<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(normalize_dream_skin_user_transparency(&Value::deserialize(deserializer)?))
+}
+
 fn deserialize_stepwise_max_items<'de, D>(deserializer: D) -> Result<u8, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -2389,6 +2451,28 @@ where
         .unwrap_or_else(default_stepwise_timeout_ms))
 }
 
+// 兼容直接写入 JSON 对象的配置；保存时仍使用原有文本形态。
+// 对象里直接写数字的（`{"model-a": 500000}`）转成文本形态里的字符串：窗口、压缩百分比这两张表
+// 应用时只认字符串值，原样留着数字会在切换供应商时报「值必须是字符串」。
+fn deserialize_json_text<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Option::<Value>::deserialize(deserializer)? {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(text)) => text,
+        Some(Value::Object(mut map)) => {
+            for value in map.values_mut() {
+                if let Value::Number(number) = value {
+                    *value = Value::String(number.to_string());
+                }
+            }
+            Value::Object(map).to_string()
+        }
+        Some(other) => other.to_string(),
+    })
+}
+
 fn deserialize_profile_api_key<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -2407,7 +2491,6 @@ pub fn normalize_codex_extra_args(args: &[String]) -> Vec<String> {
 #[derive(Debug, Clone)]
 pub struct SettingsStore {
     path: PathBuf,
-    tuning_backfill: Option<crate::session_tuning::PendingBackfill>,
 }
 
 struct SettingsFileLock(File);
@@ -2478,11 +2561,7 @@ impl Drop for SettingsNormalizeGuard {
 
 impl SettingsStore {
     pub fn new(path: PathBuf) -> Self {
-        Self { path, tuning_backfill: None }
-    }
-
-    pub(crate) fn with_tuning_backfill(&self, pending: crate::session_tuning::PendingBackfill) -> Self {
-        Self { path: self.path.clone(), tuning_backfill: Some(pending) }
+        Self { path }
     }
 
     /// 与设置提交串行绑定，不能让启动时加载的旧授权跨过后续撤销。
@@ -2665,9 +2744,6 @@ impl SettingsStore {
         next.remove("revision");
         // 完整表单不能擦除新版本或拓展写入的未知字段；profile 以稳定 ID 对齐。
         preserve_unknown_settings_fields(&mut next, &raw)?;
-        if let Some(pending) = &self.tuning_backfill {
-            pending.store_in(&mut next)?;
-        }
         next.remove("revision");
         update_weixin_outbound_revision(&mut next, &raw);
         serialize_settings_bounded(&Value::Object(next))
@@ -3303,6 +3379,21 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
             Value::String(value.trim().to_string()),
         );
     }
+    // null 清回「跟随主题」；数字按 0–100 归一；其它值不动原设置。
+    match source.get("codexAppDreamSkinUserTransparency") {
+        Some(Value::Null) => {
+            target.remove("codexAppDreamSkinUserTransparency");
+        }
+        Some(value) => {
+            if let Some(percent) = normalize_dream_skin_user_transparency(value) {
+                target.insert(
+                    "codexAppDreamSkinUserTransparency".to_string(),
+                    Value::from(percent),
+                );
+            }
+        }
+        None => {}
+    }
     if let Some(value) = source.get("codexGoalsEnabled").and_then(Value::as_bool) {
         target.insert("codexGoalsEnabled".to_string(), Value::Bool(value));
     }
@@ -3604,6 +3695,7 @@ pub(crate) const RELAY_PROFILE_KNOWN_FIELDS: &[&str] = &[
     "protocol",
     "relayMode",
     "officialMixApiKey",
+    "inactiveMixedApi",
     "officialAccountRef",
     "noAuth",
     "hideOfficialUsageAlert",
@@ -3634,6 +3726,7 @@ pub(crate) const RELAY_PROFILE_KNOWN_FIELDS: &[&str] = &[
     "strictResponsesReasoning",
     "stripImageGenerationTool",
     "stripResponsesImageDetail",
+    "stripResponsesOutputEncryptedContent",
     "disableToolSearch",
     "pureApiImageGeneration",
     "autoReviewModel",
@@ -3782,10 +3875,14 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
     settings.ccs_db_path = settings.ccs_db_path.trim().to_string();
     settings.ccs_import_sources.retain(|id, _| settings.relay_profiles.iter().any(|profile| &profile.id == id));
     let (common, extracted_context) =
-        crate::relay_config::split_context_config_sections(&settings.relay_common_config_contents);
-    settings.relay_common_config_contents = common;
+        split_context_config_sections(&settings.relay_common_config_contents);
+    let context = join_config_sections(&[
+        settings.relay_context_config_contents.as_str(),
+        extracted_context.as_str(),
+    ]);
+    settings.relay_common_config_contents = crate::relay_config::normalize_config_text(&common);
     settings.relay_context_config_contents = crate::relay_config::strip_legacy_skill_tables(
-        &crate::relay_config::join_config_sections(&settings.relay_context_config_contents, &extracted_context),
+        &crate::relay_config::normalize_config_text(&context),
     );
     for profile in &mut settings.relay_profiles {
         let mut normalized = profile.clone();
@@ -3895,6 +3992,54 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
     // 都会经过，两边不会漂移。
     settings.sync_tool_shards();
     settings
+}
+
+fn split_context_config_sections(config: &str) -> (String, String) {
+    let mut common = Vec::new();
+    let mut context = Vec::new();
+    let mut in_context_table = false;
+
+    for line in config.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_context_table = is_context_table_header(trimmed);
+        }
+        if in_context_table {
+            context.push(line);
+        } else {
+            common.push(line);
+        }
+    }
+
+    (
+        normalize_text_config(common.join("\n")),
+        normalize_text_config(context.join("\n")),
+    )
+}
+
+fn is_context_table_header(header: &str) -> bool {
+    header.starts_with("[mcp_servers.")
+        || header.starts_with("[skills.")
+        || header.starts_with("[plugins.")
+}
+
+fn join_config_sections(sections: &[&str]) -> String {
+    let joined = sections
+        .iter()
+        .map(|section| section.trim())
+        .filter(|section| !section.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    normalize_text_config(joined)
+}
+
+fn normalize_text_config(contents: String) -> String {
+    let trimmed = contents.trim();
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("{trimmed}\n")
+    }
 }
 
 /// 逐级解析软链接（最多 16 层，防环），返回最终目标路径；不是软链接时返回 None。
@@ -4430,6 +4575,29 @@ mod tests {
         };
 
         assert!(settings.active_relay_uses_protocol_proxy());
+    }
+
+    #[test]
+    fn relay_profile_accepts_json_text_fields_written_as_maps() {
+        let profile: RelayProfile = serde_json::from_value(serde_json::json!({
+            "id": "relay",
+            "name": "Relay",
+            "modelWindows": { "model-a": 500000 },
+            "modelAutoCompact": { "model-a": 80 },
+            "modelMetadata": { "model-a": { "supports_search_tool": true } },
+            "modelVlm": { "model-a": "strip" }
+        }))
+        .unwrap();
+
+        let saved = serde_json::to_value(&profile).unwrap();
+        // 数字值转成字符串：应用供应商时这两张表只认字符串值。
+        assert_eq!(saved["modelWindows"], r#"{"model-a":"500000"}"#);
+        assert_eq!(saved["modelAutoCompact"], r#"{"model-a":"80"}"#);
+        assert_eq!(
+            saved["modelMetadata"],
+            r#"{"model-a":{"supports_search_tool":true}}"#
+        );
+        assert_eq!(saved["modelVlm"], r#"{"model-a":"strip"}"#);
     }
 
     #[test]
@@ -5788,54 +5956,6 @@ experimental_bearer_token = "sk-existing""#
     }
 
     #[test]
-    fn settings_store_update_extracts_context_without_splitting_toml_values() {
-        let dir = temp_dir();
-        let store = SettingsStore::new(dir.join("settings.json"));
-        let template = r#"# shared
-developer_instructions = '''
-[mcp_servers.fake]
-example = 1
-example = 2
-[plugins.fake]
-'''
-"plugins.literal" = "common"
-"mcp_servers".new.command = "new" # dotted
-'plugins' = { 'a.b' = { enabled = true } } # inline
-["permissions".local] # common table
-description = "mine"
-[ "mcp_servers".quoted ] # real table
-command = "quoted"
-[[skills.config]]
-path = "/one"
-[[skills.config]]
-path = "/two"
-"#;
-        let updated = store.update(json!({
-            "relayCommonConfigContents": template,
-            "relayContextConfigContents": "[mcp_servers.old]\ncommand = 'old'\n[[skills.config]]\npath = '/old-one'\n[[skills.config]]\npath = '/old-two'\n",
-        })).unwrap();
-        let common = &updated.relay_common_config_contents;
-        let context = &updated.relay_context_config_contents;
-        let shared: toml::Table = common.parse().unwrap();
-        let original: toml::Table = template.parse().unwrap();
-        assert_eq!(shared["developer_instructions"], original["developer_instructions"]);
-        assert_eq!(shared["plugins.literal"], original["plugins.literal"]);
-        assert_eq!(shared["permissions"], original["permissions"]);
-        assert_eq!(shared.len(), 3);
-        assert!(common.contains("# shared") && common.contains("# common table"));
-        let combined: toml::Table = crate::relay_config::join_config_sections(common, context).parse().unwrap();
-        assert_eq!(combined["mcp_servers"]["old"]["command"].as_str(), Some("old"));
-        assert_eq!(combined["mcp_servers"]["new"], original["mcp_servers"]["new"]);
-        assert_eq!(combined["mcp_servers"]["quoted"], original["mcp_servers"]["quoted"]);
-        assert_eq!(combined["plugins"], original["plugins"]);
-        let paths: Vec<_> = combined["skills"]["config"].as_array().unwrap().iter()
-            .map(|entry| entry["path"].as_str().unwrap()).collect();
-        assert_eq!(paths, ["/old-one", "/old-two", "/one", "/two"]);
-        assert_eq!(combined["permissions"], original["permissions"]);
-        assert_eq!(store.load().unwrap(), updated);
-    }
-
-    #[test]
     fn settings_store_update_persists_aggregate_relay_profiles_and_active_id() {
         let dir = temp_dir();
         let store = SettingsStore::new(dir.join("settings.json"));
@@ -6163,6 +6283,58 @@ path = "/two"
             ..BackendSettings::default()
         };
         assert!(!off.active_relay_transport_uses_protocol_proxy());
+    }
+
+    /// 「不发送 output.encrypted_content」也只在代理里执行：开启后必须改走本地代理，
+    /// 关闭后立即恢复直连，并确认配置按 camelCase 往返。
+    #[test]
+    fn strip_responses_output_encrypted_content_routes_through_protocol_proxy() {
+        let enabled = RelayProfile {
+            id: "on".to_string(),
+            relay_mode: RelayMode::PureApi,
+            protocol: RelayProtocol::Responses,
+            base_url: "https://responses.example.test/v1".to_string(),
+            strip_responses_output_encrypted_content: true,
+            ..RelayProfile::default()
+        };
+        assert!(enabled.strips_responses_output_encrypted_content());
+        let value = serde_json::to_value(&enabled).unwrap();
+        assert_eq!(value["stripResponsesOutputEncryptedContent"], true);
+        let restored: RelayProfile = serde_json::from_value(value).unwrap();
+        assert!(restored.strips_responses_output_encrypted_content());
+
+        let settings = BackendSettings {
+            active_relay_id: "on".to_string(),
+            relay_profiles: vec![enabled.clone()],
+            ..BackendSettings::default()
+        };
+        assert!(settings.active_relay_transport_uses_protocol_proxy());
+        let off = BackendSettings {
+            active_relay_id: "on".to_string(),
+            relay_profiles: vec![RelayProfile {
+                strip_responses_output_encrypted_content: false,
+                ..enabled
+            }],
+            ..BackendSettings::default()
+        };
+        assert!(!off.active_relay_transport_uses_protocol_proxy());
+
+        let default = serde_json::to_value(RelayProfile::default()).unwrap();
+        assert!(
+            default
+                .get("stripResponsesOutputEncryptedContent")
+                .is_none()
+        );
+
+        let dir = temp_dir();
+        let store = SettingsStore::new(dir.join("settings.json"));
+        let mut persisted = settings.clone();
+        store.save(&persisted).unwrap();
+        persisted = store.load().unwrap();
+        assert!(persisted.relay_profiles[0].strip_responses_output_encrypted_content);
+        persisted.relay_profiles[0].strip_responses_output_encrypted_content = false;
+        store.save(&persisted).unwrap();
+        assert!(!store.load().unwrap().relay_profiles[0].strip_responses_output_encrypted_content);
     }
 
     #[test]

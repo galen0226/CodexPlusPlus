@@ -392,22 +392,12 @@ struct WeixinRuntime {
     finished: tokio::sync::watch::Receiver<bool>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DreamSkinImagePayload {
-    pub path: String,
-    pub content_type: String,
-    pub size_bytes: u64,
-}
-
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DreamSkinRuntimeRequest {
     pub debug_port: u16,
     #[serde(default = "default_dream_skin_helper_port")]
     pub helper_port: u16,
-    #[serde(default)]
-    pub screenshot_path: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -609,7 +599,6 @@ pub struct LiveContextEntriesPayload {
 #[serde(rename_all = "camelCase")]
 pub struct ExtractRelayCommonConfigPayload {
     pub common_config_contents: String,
-    pub context_config_contents: String,
     pub profile_config_contents: String,
 }
 
@@ -721,8 +710,6 @@ pub struct ContextDeleteRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ExtractRelayCommonConfigRequest {
     pub config_contents: String,
-    #[serde(default)]
-    pub context_config_contents: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -3235,7 +3222,8 @@ fn restart_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
     // 早先用 `find_codex_processes_for_debug_port`，但它在非 macOS 上返回全部
     // Codex 进程：Windows 上只要有多开实例在跑，就会把「主 Codex 没开」误判成
     // 「已运行」，进而走进重启分支去停进程。
-    let app_running = codex_plus_core::cdp::endpoint_available(request.debug_port);
+    let app_running =
+        codex_plus_core::cdp::endpoint_available(running_debug_port(request.debug_port));
     if restart_disposition(request.sync_active_relay, app_running, cfg!(windows))
         == RestartDisposition::LaunchOnly
     {
@@ -3433,10 +3421,10 @@ fn stop_main_codex_process(request: &LaunchRequest) -> anyhow::Result<usize> {
         );
     }
     #[cfg(not(windows))]
-    let was_running = codex_plus_core::cdp::endpoint_available(request.debug_port)
-        || main_codex_running_without_debug_port();
+    let debug_port = running_debug_port(request.debug_port);
     #[cfg(not(windows))]
-    let debug_port = request.debug_port;
+    let was_running = codex_plus_core::cdp::endpoint_available(debug_port)
+        || main_codex_running_without_debug_port();
     #[cfg(target_os = "macos")]
     codex_plus_core::watcher::stop_main_codex_processes_and_wait(debug_port);
     #[cfg(not(any(windows, target_os = "macos")))]
@@ -3450,6 +3438,32 @@ fn stop_main_codex_process(request: &LaunchRequest) -> anyhow::Result<usize> {
     anyhow::ensure!(!main_codex_running_without_debug_port(), "Codex 进程尚未退出");
     #[cfg(not(windows))]
     Ok(usize::from(was_running))
+}
+
+/// 主 Codex 实际在用的调试端口。
+///
+/// 首选端口被别的程序占着时，启动器会给 Codex 换一个空闲端口（见
+/// `ports::select_packaged_codex_debug_port`）。这时按表单里的端口探测，会把正在运行的 Codex
+/// 当成「没开」：「重启」只启动不停止、复用旧会话，「停止」直接报没有在运行（#3191）。
+/// 本进程拉起的会话还活着时，以它的端口为准。
+fn running_debug_port(requested: u16) -> u16 {
+    let session = codex_plus_launcher::session_snapshot();
+    resolve_running_debug_port(
+        requested,
+        session.owned.then_some(session.debug_port).flatten(),
+        codex_plus_core::cdp::endpoint_available,
+    )
+}
+
+fn resolve_running_debug_port(
+    requested: u16,
+    owned: Option<u16>,
+    endpoint_available: impl Fn(u16) -> bool,
+) -> u16 {
+    match owned {
+        Some(port) if port != requested && endpoint_available(port) => port,
+        _ => requested,
+    }
 }
 
 /// 主 Codex 开着却没带调试端口：从 Dock / Finder 等外部启动，调试端口探测不到它。
@@ -3491,7 +3505,7 @@ fn stop_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
         }),
     );
     if !cfg!(windows)
-        && !codex_plus_core::cdp::endpoint_available(request.debug_port)
+        && !codex_plus_core::cdp::endpoint_available(running_debug_port(request.debug_port))
         && !main_codex_running_without_debug_port()
     {
         return ok("Codex 没有在运行。", json!({}));
@@ -3737,13 +3751,9 @@ where
     F: FnOnce(&LaunchRequest) -> anyhow::Result<()>,
 {
     let mut warnings = Vec::new();
-    let mut tuning_rollback = None;
     let snapshot = if let Some(settings) = settings {
         let snapshot = RelayLiveSnapshot::capture(home)?;
-        if let Err(error) = sync_active_relay_to_home_tracking(settings, home, &mut tuning_rollback) {
-            if error.to_string().contains("settings_revision_conflict") {
-                return Err(error);
-            }
+        if let Err(error) = sync_active_relay_to_home(settings, home) {
             if let Err(restore_error) = snapshot.restore(home) {
                 anyhow::bail!("同步当前供应商失败：{error}；回滚 live 配置也失败：{restore_error}");
             }
@@ -3761,13 +3771,8 @@ where
 
     if let Err(error) = spawn(request) {
         if let Some(snapshot) = snapshot {
-            let restore = || snapshot.restore(home);
-            let restored = match tuning_rollback {
-                Some(receipt) => receipt.restore(restore),
-                None => restore(),
-            };
-            if let Err(restore_error) = restored {
-                anyhow::bail!("启动 Codex 失败：{error}；回滚配置也失败：{restore_error}");
+            if let Err(restore_error) = snapshot.restore(home) {
+                anyhow::bail!("启动 Codex 失败：{error}；回滚 live 配置也失败：{restore_error}");
             }
         }
         return Err(error);
@@ -3827,42 +3832,23 @@ fn apply_relay_profile_honoring_preservation(
     relay: &RelayProfile,
     settings: &BackendSettings,
 ) -> anyhow::Result<codex_plus_core::relay_config::RelayApplyResult> {
-    reapply_template(home, relay, settings).map(|(result, _)| result)
+    codex_plus_core::relay_config::apply_relay_profile_with_preservation(
+        home,
+        relay,
+        &relay_combined_common_config(settings),
+        codex_plus_core::protocol_proxy::protocol_proxy_port(),
+        settings.relay_preserve_nonprovider_settings,
+    )
 }
 
-fn reapply_template(home: &Path, relay: &RelayProfile, settings: &BackendSettings)
-    -> anyhow::Result<(codex_plus_core::relay_config::RelayApplyResult, Option<codex_plus_core::session_tuning::TemplateReapplyRollback>)>
-{
-    let common = relay_combined_common_config(settings);
-    let port = codex_plus_core::protocol_proxy::protocol_proxy_port();
-    codex_plus_core::session_tuning::with_template_reapply(&SettingsStore::default(), settings, || {
-        codex_plus_core::relay_config::apply_relay_profile_with_preservation(
-            home, relay, &common, port, settings.relay_preserve_nonprovider_settings,
-        )
-    })
-}
-
-#[cfg(test)]
 fn sync_active_relay_to_home(
     settings: &BackendSettings,
     home: &Path,
-) -> anyhow::Result<codex_plus_core::relay_config::RelayApplyResult> {
-    sync_active_relay_to_home_tracking(settings, home, &mut None)
-}
-
-fn sync_active_relay_to_home_tracking(
-    settings: &BackendSettings,
-    home: &Path,
-    rollback: &mut Option<codex_plus_core::session_tuning::TemplateReapplyRollback>,
 ) -> anyhow::Result<codex_plus_core::relay_config::RelayApplyResult> {
     if !settings.relay_profiles_enabled {
         anyhow::bail!("供应商配置总开关已关闭，未同步 live 配置");
     }
     let relay = settings.active_relay_profile();
-    let mut apply = || reapply_template(home, &relay, settings).map(|(result, receipt)| {
-        *rollback = receipt;
-        result
-    });
     if relay.relay_mode == codex_plus_core::settings::RelayMode::Aggregate {
         if settings.active_aggregate_relay_profile().is_none() {
             anyhow::bail!("当前聚合供应商配置不完整");
@@ -3871,7 +3857,7 @@ fn sync_active_relay_to_home_tracking(
             .active_aggregate_relay_profile()
             .ok_or_else(|| anyhow::anyhow!("当前聚合供应商配置不完整"))?;
         if aggregate.model_aggregation_enabled {
-            return apply();
+            return apply_relay_profile_honoring_preservation(home, &relay, settings);
         }
         return codex_plus_core::relay_config::apply_relay_config_to_home_with_session_provider(
             home,
@@ -3895,7 +3881,7 @@ fn sync_active_relay_to_home_tracking(
         );
     }
     if relay_has_complete_files(&relay) {
-        return apply();
+        return apply_relay_profile_honoring_preservation(home, &relay, settings);
     }
 
     let mut base_url = relay.base_url.trim().to_string();
@@ -4858,6 +4844,21 @@ pub fn save_settings(
     if let Some(revision) = expected_revision {
         settings.settings_revision = revision;
     }
+    let mut settings = normalize_settings_before_save(settings);
+    // 保存诊断：供应商模型列表被改小/改大时能直接看出「提交上来的到底是什么」。
+    // 用户反馈过「删掉一行保存后又变回三行」，只有把每次保存的行数记下来才能区分
+    // 「界面没提交改动」和「提交了又被别处覆盖」。
+    log_manager_event(
+        "manager.save_settings",
+        json!({
+            "activeRelayId": settings.active_relay_id,
+            "relayProfiles": settings.relay_profiles.iter().map(|profile| json!({
+                "id": profile.id,
+                "modelCount": profile.model_list.lines().filter(|line| !line.trim().is_empty()).count(),
+                "models": profile.model_list.lines().filter(|line| !line.trim().is_empty()).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        }),
+    );
     let Ok(_guard) = relay_switch_mutex().lock() else {
         return failed(
             "供应商切换锁已损坏，请重启管理器后再试。",
@@ -4872,34 +4873,7 @@ pub fn save_settings(
         );
     };
     let store = SettingsStore::default();
-    let previous = match store.load() {
-        Ok(previous) => previous,
-        Err(error) => return failed(&error.to_string(), fallback_settings_payload()),
-    };
-    if previous.relay_common_config_contents != settings.relay_common_config_contents
-        && let Err(error) = codex_plus_core::relay_config::validate_shared_config_draft(
-            &settings.relay_common_config_contents,
-        )
-    {
-        return failed(&error.to_string(), SettingsPayload {
-            revision: previous.settings_revision.clone(),
-            settings: previous,
-            settings_path: codex_plus_core::paths::default_settings_path().display().to_string(),
-            user_scripts: user_script_inventory(),
-        });
-    }
-    let mut settings = normalize_settings_before_save(settings);
-    log_manager_event(
-        "manager.save_settings",
-        json!({
-            "activeRelayId": settings.active_relay_id,
-            "relayProfiles": settings.relay_profiles.iter().map(|profile| json!({
-                "id": profile.id,
-                "modelCount": profile.model_list.lines().filter(|line| !line.trim().is_empty()).count(),
-                "models": profile.model_list.lines().filter(|line| !line.trim().is_empty()).collect::<Vec<_>>(),
-            })).collect::<Vec<_>>(),
-        }),
-    );
+    let previous = store.load().unwrap_or_default();
     // 原生登录仅由独立选择命令更新，普通偏好表单不能覆盖刚发布的身份。
     settings.native_auth_selection = previous.native_auth_selection.clone();
     if let Err(error) = codex_plus_core::connect::outbound::validate_settings_change(&previous, &settings) {
@@ -4974,86 +4948,6 @@ pub fn save_settings(
                 fallback_settings_payload(),
             )
         }
-    }
-}
-
-#[tauri::command]
-pub fn import_dream_skin_image(path: String) -> CommandResult<DreamSkinImagePayload> {
-    let source = PathBuf::from(path.trim());
-    let state_dir = codex_plus_core::paths::default_app_state_dir();
-    let store = SettingsStore::default();
-    let previous = store.load().unwrap_or_default();
-    let previous_path = PathBuf::from(previous.codex_app_dream_skin_image_path.trim());
-    let previous_backup = managed_dream_skin_image_backup(&previous_path, &state_dir).ok();
-
-    let imported = match codex_plus_core::dream_skin::import_dream_skin_image(&source, &state_dir) {
-        Ok(path) => path,
-        Err(error) => {
-            return failed(
-                &format!("导入皮肤图片失败：{error}"),
-                empty_dream_skin_image_payload(),
-            );
-        }
-    };
-    if let Err(error) = store.update(json!({
-        "codexAppDreamSkinImagePath": imported.to_string_lossy()
-    })) {
-        let _ = codex_plus_core::dream_skin::clear_managed_dream_skin_image(&state_dir);
-        if let Some(backup) = previous_backup {
-            let _ = restore_managed_dream_skin_image_backup(backup);
-        }
-        return failed(
-            &format!("保存皮肤图片设置失败：{error}"),
-            empty_dream_skin_image_payload(),
-        );
-    }
-
-    let size_bytes = fs::metadata(&imported)
-        .map(|metadata| metadata.len())
-        .unwrap_or_default();
-    ok(
-        "皮肤图片已导入。",
-        DreamSkinImagePayload {
-            path: imported.to_string_lossy().to_string(),
-            content_type: dream_skin_content_type(&imported).to_string(),
-            size_bytes,
-        },
-    )
-}
-
-#[tauri::command]
-pub fn reset_dream_skin_image() -> CommandResult<DreamSkinImagePayload> {
-    let state_dir = codex_plus_core::paths::default_app_state_dir();
-    let store = SettingsStore::default();
-    let previous = store.load().unwrap_or_default();
-    if let Err(error) = store.update(json!({ "codexAppDreamSkinImagePath": "" })) {
-        return failed(
-            &format!("恢复默认皮肤图片失败：{error}"),
-            empty_dream_skin_image_payload(),
-        );
-    }
-    if let Err(error) = codex_plus_core::dream_skin::clear_managed_dream_skin_image(&state_dir) {
-        let _ = store.update(json!({
-            "codexAppDreamSkinImagePath": previous.codex_app_dream_skin_image_path
-        }));
-        return failed(
-            &format!("清理自定义皮肤图片失败：{error}"),
-            empty_dream_skin_image_payload(),
-        );
-    }
-    ok("已恢复目标项目默认图片。", empty_dream_skin_image_payload())
-}
-
-#[tauri::command]
-pub fn list_dream_skin_themes()
--> CommandResult<codex_plus_core::dream_skin_library::DreamSkinThemeLibrary> {
-    let settings = SettingsStore::default().load().unwrap_or_default();
-    match current_dream_skin_library(&settings) {
-        Ok(library) => ok("Dream Skin 主题库已加载。", library),
-        Err(error) => failed(
-            &format!("读取 Dream Skin 主题库失败：{error}"),
-            empty_dream_skin_library(&settings),
-        ),
     }
 }
 
@@ -5277,22 +5171,6 @@ pub async fn install_dream_skin_market_theme(id: String) -> CommandResult<DreamS
 }
 
 #[tauri::command]
-pub fn load_dream_skin_theme(
-    id: String,
-) -> CommandResult<codex_plus_core::dream_skin_library::DreamSkinThemeDraft> {
-    match codex_plus_core::dream_skin_library::load_stored_dream_skin_theme(
-        &codex_plus_core::paths::default_app_state_dir(),
-        id.trim(),
-    ) {
-        Ok(draft) => ok("Dream Skin 主题已加载。", draft),
-        Err(error) => failed(
-            &format!("加载 Dream Skin 主题失败：{error}"),
-            builtin_dream_skin_draft(),
-        ),
-    }
-}
-
-#[tauri::command]
 pub fn create_dream_skin_theme(
     path: String,
 ) -> CommandResult<codex_plus_core::dream_skin_library::DreamSkinThemeDraft> {
@@ -5496,51 +5374,6 @@ pub async fn dream_skin_status(
 }
 
 #[tauri::command]
-pub async fn apply_dream_skin(
-    request: DreamSkinRuntimeRequest,
-) -> CommandResult<codex_plus_core::dream_skin_runtime::DreamSkinRuntimeStatus> {
-    let store = SettingsStore::default();
-    let settings = match store.update(json!({ "codexAppDreamSkinPaused": false })) {
-        Ok(settings) => settings,
-        Err(error) => {
-            return failed(
-                &format!("更新 Dream Skin 状态失败：{error}"),
-                codex_plus_core::dream_skin_runtime::DreamSkinRuntimeStatus::not_running(
-                    true, false,
-                ),
-            );
-        }
-    };
-    if !settings.enhancements_enabled || !settings.codex_app_dream_skin_enabled {
-        return failed(
-            "请先启用 Codex增强和 Dream Skin。",
-            codex_plus_core::dream_skin_runtime::dream_skin_status(request.debug_port).await,
-        );
-    }
-    if let Err(error) = codex_plus_core::dream_skin::sync_default_dream_skin_base_theme(
-        true,
-        &settings.codex_app_dream_skin_theme_config,
-    ) {
-        return failed(
-            &format!("同步 Dream Skin 基础主题失败：{error}"),
-            codex_plus_core::dream_skin_runtime::dream_skin_status(request.debug_port).await,
-        );
-    }
-    match codex_plus_core::dream_skin_runtime::apply_dream_skin_live(
-        request.debug_port,
-        request.helper_port,
-    )
-    .await
-    {
-        Ok(status) => ok("Dream Skin 已应用。", status),
-        Err(error) => failed(
-            &format!("实时应用失败，下次启动会继续应用：{error}"),
-            codex_plus_core::dream_skin_runtime::DreamSkinRuntimeStatus::not_running(true, false),
-        ),
-    }
-}
-
-#[tauri::command]
 pub async fn restore_dream_skin(
     request: DreamSkinRuntimeRequest,
 ) -> CommandResult<codex_plus_core::dream_skin_runtime::DreamSkinRuntimeStatus> {
@@ -5571,67 +5404,6 @@ pub async fn restore_dream_skin(
         Err(error) => ok(
             &format!("外观配置已恢复，重启 Codex 后完整生效；当前无法清理实时皮肤：{error}"),
             status,
-        ),
-    }
-}
-
-#[tauri::command]
-pub fn reset_dream_skin_theme() -> CommandResult<SettingsPayload> {
-    let store = SettingsStore::default();
-    let previous = store.load().unwrap_or_default();
-    let theme = serde_json::to_value(codex_plus_core::settings::DreamSkinThemeConfig::default())
-        .unwrap_or_else(|_| json!({}));
-    if let Err(error) = store.update(json!({
-        "codexAppDreamSkinThemeConfig": theme,
-        "codexAppDreamSkinImagePath": ""
-    })) {
-        return failed(
-            &format!("恢复默认 Dream Skin 主题失败：{error}"),
-            fallback_settings_payload(),
-        );
-    }
-    if let Err(error) = codex_plus_core::dream_skin::clear_managed_dream_skin_image(
-        &codex_plus_core::paths::default_app_state_dir(),
-    ) {
-        let previous_theme = serde_json::to_value(&previous.codex_app_dream_skin_theme_config)
-            .unwrap_or_else(|_| json!({}));
-        let _ = store.update(json!({
-            "codexAppDreamSkinThemeConfig": previous_theme,
-            "codexAppDreamSkinImagePath": previous.codex_app_dream_skin_image_path
-        }));
-        return failed(
-            &format!("清理自定义 Dream Skin 图片失败：{error}"),
-            fallback_settings_payload(),
-        );
-    }
-    settings_payload("已恢复目标项目默认主题。", "恢复后重新读取设置失败")
-}
-
-#[tauri::command]
-pub async fn verify_dream_skin(
-    request: DreamSkinRuntimeRequest,
-) -> CommandResult<codex_plus_core::dream_skin_runtime::DreamSkinVerification> {
-    let screenshot = request
-        .screenshot_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(Path::new);
-    match codex_plus_core::dream_skin_runtime::verify_dream_skin(request.debug_port, screenshot)
-        .await
-    {
-        Ok(result) if result.pass => ok("Dream Skin 实机验证通过。", result),
-        Ok(result) => failed("Dream Skin 实机验证未通过。", result),
-        Err(error) => failed(
-            &format!("Dream Skin 实机验证失败：{error}"),
-            codex_plus_core::dream_skin_runtime::DreamSkinVerification {
-                state: codex_plus_core::dream_skin_runtime::DreamSkinState::NotRunning,
-                pass: false,
-                version: None,
-                checks: Vec::new(),
-                screenshot_path: None,
-                raw: json!({}),
-            },
         ),
     }
 }
@@ -5719,14 +5491,6 @@ async fn failed_dream_skin_activation_payload(
     }
 }
 
-fn empty_dream_skin_image_payload() -> DreamSkinImagePayload {
-    DreamSkinImagePayload {
-        path: String::new(),
-        content_type: String::new(),
-        size_bytes: 0,
-    }
-}
-
 fn managed_dream_skin_image_backup(
     path: &Path,
     state_dir: &Path,
@@ -5744,22 +5508,6 @@ fn restore_managed_dream_skin_image_backup(
     backup: ManagedDreamSkinImageBackup,
 ) -> anyhow::Result<()> {
     codex_plus_core::settings::atomic_write(&backup.path, &backup.bytes)
-}
-
-fn dream_skin_content_type(path: &Path) -> &'static str {
-    match path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("png") => "image/png",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("webp") => "image/webp",
-        Some("gif") => "image/gif",
-        Some("bmp") => "image/bmp",
-        _ => "application/octet-stream",
-    }
 }
 
 #[tauri::command]
@@ -6291,6 +6039,107 @@ fn archive_one_local_session(path: &Path, session_id: &str, archived: bool) -> a
     Ok(())
 }
 
+#[derive(Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRelocationPreviewPayload {
+    #[serde(flatten)]
+    plan: codex_plus_data::SessionRelocationPlan,
+    /// 目标目录在本机是否存在。
+    target_exists: bool,
+    /// Codex 桌面端在运行时不能执行：它会覆盖全局状态，正在写的 rollout 也不能替换。
+    codex_running: bool,
+}
+
+fn session_relocation_target(request: &codex_plus_data::SessionRelocationRequest) -> &str {
+    match request {
+        codex_plus_data::SessionRelocationRequest::Remap { to, .. }
+        | codex_plus_data::SessionRelocationRequest::Move { to, .. } => to.trim(),
+    }
+}
+
+/// 预览会话目录重定位（#1085）：只读，列出会改到新目录的会话和跟着改的项目根路径。
+#[tauri::command]
+pub async fn preview_session_relocation(
+    request: codex_plus_data::SessionRelocationRequest,
+) -> CommandResult<SessionRelocationPreviewPayload> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
+        match codex_plus_data::plan_session_relocation(&home, &request) {
+            Ok(plan) => ok(
+                &format!("将把 {} 个会话改到新目录。", plan.items.len()),
+                SessionRelocationPreviewPayload {
+                    plan,
+                    target_exists: Path::new(session_relocation_target(&request)).is_dir(),
+                    codex_running: !codex_plus_core::watcher::find_session_index_cleanup_blocking_processes()
+                        .is_empty(),
+                },
+            ),
+            Err(error) => failed(&format!("无法移动会话：{error:#}"), Default::default()),
+        }
+    })
+    .await
+    .unwrap_or_else(|error| failed(&format!("预览会话移动失败：{error}"), Default::default()))
+}
+
+/// 执行会话目录重定位（#1085）：会话库、侧边栏目录库、rollout 和全局状态一起改，改动前的值写进备份目录。
+#[tauri::command]
+pub async fn apply_session_relocation(
+    request: codex_plus_data::SessionRelocationRequest,
+) -> CommandResult<codex_plus_data::SessionRelocationReport> {
+    tauri::async_runtime::spawn_blocking(move || apply_session_relocation_blocking(request))
+        .await
+        .unwrap_or_else(|error| failed(&format!("移动会话的后台任务失败：{error}"), Default::default()))
+}
+
+fn apply_session_relocation_blocking(
+    request: codex_plus_data::SessionRelocationRequest,
+) -> CommandResult<codex_plus_data::SessionRelocationReport> {
+    let running = codex_plus_core::watcher::find_session_index_cleanup_blocking_processes();
+    if !running.is_empty() {
+        return failed("Codex 仍在运行，请完全退出 Codex 后再移动会话。", Default::default());
+    }
+    let target = session_relocation_target(&request);
+    if !Path::new(target).is_dir() {
+        return failed(&format!("目标文件夹不存在：{target}"), Default::default());
+    }
+    let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
+    let backups = codex_plus_core::paths::default_app_state_dir().join("backups");
+    let report = match codex_plus_data::apply_session_relocation(&home, &request, &backups) {
+        Ok(report) => report,
+        Err(error) => return failed(&format!("移动会话失败：{error:#}"), Default::default()),
+    };
+    log_manager_event(
+        "manager.session_relocation.finish",
+        json!({
+            "moved": report.moved,
+            "rollouts_rewritten": report.rollouts_rewritten,
+            "rollouts_missing": report.rollouts_missing,
+            "project_roots_updated": report.project_roots_updated,
+            "failures": report.failures.len(),
+            "backup_dir": report.backup_dir,
+        }),
+    );
+    if report.moved == 0 && report.project_roots_updated == 0 && report.failures.is_empty() {
+        return ok("没有需要移动的会话。", report);
+    }
+    let mut message = format!("已把 {} 个会话改到新目录", report.moved);
+    if report.rollouts_missing > 0 {
+        message.push_str(&format!("（其中 {} 个找不到会话文件，只更新了索引）", report.rollouts_missing));
+    }
+    if report.project_roots_updated > 0 {
+        message.push_str(&format!("，更新了 {} 处项目根路径", report.project_roots_updated));
+    }
+    if let Some(backup) = &report.backup_dir {
+        message.push_str(&format!("。改动前的记录已备份到 {backup}"));
+    }
+    if report.failures.is_empty() {
+        ok(&format!("{message}。"), report)
+    } else {
+        let details = report.failures.iter().take(3).cloned().collect::<Vec<_>>().join("；");
+        failed(&format!("{message}；{} 项未完成：{details}", report.failures.len()), report)
+    }
+}
+
 /// 归一化「Codex 应用路径」。**无效路径一律丢弃，不落库。**
 ///
 /// 之前的写法是 normalize 成功才覆盖、失败就原样保留，于是误选的路径会被存进
@@ -6320,10 +6169,10 @@ fn normalize_settings_before_save(mut settings: BackendSettings) -> BackendSetti
             &settings.relay_common_config_contents,
         );
     let (common_without_context, extracted_context) =
-        codex_plus_core::relay_config::split_context_config_sections(&settings.relay_common_config_contents);
+        split_relay_context_config_sections(&settings.relay_common_config_contents);
     settings.relay_common_config_contents = common_without_context;
     settings.relay_context_config_contents =
-        codex_plus_core::relay_config::join_config_sections(&settings.relay_context_config_contents, &extracted_context);
+        relay_join_config_sections(&[&settings.relay_context_config_contents, &extracted_context]);
     settings.relay_context_config_contents =
         codex_plus_core::relay_config::sanitize_common_config_contents(
             &settings.relay_context_config_contents,
@@ -6423,33 +6272,54 @@ fn normalize_provider_sync_provider_list(values: Vec<String>) -> Vec<String> {
 }
 
 fn relay_combined_common_config(settings: &BackendSettings) -> String {
-    codex_plus_core::relay_config::join_config_sections(
+    relay_join_config_sections(&[
         &settings.relay_common_config_contents,
         &settings.relay_context_config_contents,
+    ])
+}
+
+fn relay_join_config_sections(sections: &[&str]) -> String {
+    let sections = sections
+        .iter()
+        .map(|section| section.trim())
+        .filter(|section| !section.is_empty())
+        .collect::<Vec<_>>();
+    if sections.is_empty() {
+        String::new()
+    } else {
+        codex_plus_core::relay_config::normalize_config_text(&format!(
+            "{}\n",
+            sections.join("\n\n")
+        ))
+    }
+}
+
+fn split_relay_context_config_sections(config: &str) -> (String, String) {
+    let mut common = Vec::new();
+    let mut context = Vec::new();
+    let mut in_context_table = false;
+
+    for line in config.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_context_table = trimmed.starts_with("[mcp_servers.")
+                || trimmed.starts_with("[skills.")
+                || trimmed.starts_with("[plugins.");
+        }
+        if in_context_table {
+            context.push(line);
+        } else {
+            common.push(line);
+        }
+    }
+
+    (
+        relay_join_config_sections(&[&common.join("\n")]),
+        relay_join_config_sections(&[&context.join("\n")]),
     )
 }
 
 fn strip_common_config_text_fallback(config_contents: &str, common_config: &str) -> String {
-    if let (Ok(mut profile), Ok(common)) = (
-        config_contents.parse::<toml_edit::DocumentMut>(),
-        common_config.parse::<toml_edit::DocumentMut>(),
-    ) {
-        // 旧快照里，拼在表头后面的通用根键会变成表内的同名副本。
-        // 正常的共享字段已由 core 去除；这里不能把供应商剩下的整张表删掉。
-        for (key, value) in common.iter().filter(|(_, item)| item.is_value() && !item.is_table_like()) {
-            if !codex_plus_core::session_tuning::is_tuning_key(key) {
-                profile.remove(key);
-            }
-            for (section, _) in common.iter().filter(|(_, item)| item.is_table_like()) {
-                if let Some(table) = profile.get_mut(section).and_then(toml_edit::Item::as_table_like_mut)
-                    && table.get(key).is_some_and(|copy| copy.to_string().trim() == value.to_string().trim())
-                {
-                    table.remove(key);
-                }
-            }
-        }
-        return codex_plus_core::relay_config::normalize_config_text(&profile.to_string());
-    }
     let common = common_config_anchors(common_config);
     if common.root_keys.is_empty() && common.table_headers.is_empty() {
         return ensure_text_newline(config_contents.trim_end());
@@ -6533,9 +6403,7 @@ fn common_config_anchors(common_config: &str) -> CommonConfigAnchors {
         }
         if !in_table {
             if let Some(key) = toml_key_from_line(trimmed) {
-                if !codex_plus_core::session_tuning::is_tuning_key(key) {
-                    root_keys.insert(key.to_string());
-                }
+                root_keys.insert(key.to_string());
             }
         }
     }
@@ -7917,6 +7785,83 @@ fn import_local_skills_blocking(path: &str) -> CommandResult<SkillsPayload> {
             payload,
         )
     }
+}
+
+/// 把选中的 Skill 连同分组、各 Agent 的启用状态导出成迁移包（#2852）。
+#[tauri::command]
+pub async fn export_skill_bundle(
+    path: String,
+    skills: Vec<codex_plus_core::skills::SkillBundleSelection>,
+    groups: Vec<String>,
+) -> CommandResult<codex_plus_core::skills::SkillBundleExport> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let destination = std::path::PathBuf::from(path.trim());
+        match default_skills_manager().export_skill_bundle(&skills, &groups, &destination) {
+            Ok(outcome) if outcome.errors.is_empty() => ok(
+                &format!("已导出 {} 个 Skill：{}", outcome.exported.len(), destination.display()),
+                outcome,
+            ),
+            Ok(outcome) => failed(
+                &format!(
+                    "已导出 {} 个 Skill，{} 个未导出：{}",
+                    outcome.exported.len(),
+                    outcome.errors.len(),
+                    outcome.errors.join("；")
+                ),
+                outcome,
+            ),
+            Err(error) => failed(&format!("导出 Skill 迁移包失败：{error:#}"), Default::default()),
+        }
+    })
+    .await
+    .unwrap_or_else(|error| failed(&format!("导出 Skill 迁移包失败：{error}"), Default::default()))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillBundleImportPayload {
+    #[serde(flatten)]
+    skills: SkillsPayload,
+    bundle: codex_plus_core::skills::SkillBundleImport,
+}
+
+/// 导入 Skill 迁移包（#2852）。本机已有的同名 Skill 不覆盖文件；分组由界面按返回的清单恢复。
+#[tauri::command]
+pub async fn import_skill_bundle(path: String) -> CommandResult<SkillBundleImportPayload> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let manager = default_skills_manager();
+        let result = manager.import_skill_bundle(std::path::Path::new(path.trim()));
+        let skills = current_skills_payload(&manager);
+        match result {
+            Ok(bundle) => {
+                let summary = format!(
+                    "已导入 {} 个 Skill，{} 个本机已有（未覆盖文件）",
+                    bundle.imported.len(),
+                    bundle.existing.len()
+                );
+                if bundle.errors.is_empty() {
+                    ok(&format!("{summary}。"), SkillBundleImportPayload { skills, bundle })
+                } else {
+                    let message = format!("{summary}；{} 项失败：{}", bundle.errors.len(), bundle.errors.join("；"));
+                    failed(&message, SkillBundleImportPayload { skills, bundle })
+                }
+            }
+            Err(error) => failed(
+                &format!("导入 Skill 迁移包失败：{error:#}"),
+                SkillBundleImportPayload { skills, bundle: Default::default() },
+            ),
+        }
+    })
+    .await
+    .unwrap_or_else(|error| {
+        failed(
+            &format!("导入 Skill 迁移包失败：{error}"),
+            SkillBundleImportPayload {
+                skills: current_skills_payload(&default_skills_manager()),
+                bundle: Default::default(),
+            },
+        )
+    })
 }
 
 #[tauri::command]
@@ -9902,9 +9847,7 @@ pub fn backfill_relay_profile_from_live(
             )
         }
         Err(error) => {
-            let live_conflict = error
-                .chain()
-                .any(|cause| cause.is::<codex_plus_core::relay_config::LiveEndpointChanged>());
+            let live_conflict = codex_plus_core::relay_config::is_live_endpoint_conflict(&error);
             log_manager_event(
                 "manager.backfill_relay_profile_from_live.failed",
                 json!({
@@ -10271,18 +10214,8 @@ pub fn extract_relay_common_config(
                     &request.config_contents,
                     &common_config_contents,
                 )?;
-            let (common_config_contents, context_config_contents) =
-                codex_plus_core::relay_config::split_context_config_sections(&common_config_contents);
             Ok(ExtractRelayCommonConfigPayload {
                 common_config_contents,
-                context_config_contents: if context_config_contents.is_empty() {
-                    String::new()
-                } else {
-                    codex_plus_core::relay_config::join_config_sections(
-                        &context_config_contents,
-                        &request.context_config_contents,
-                    )
-                },
                 profile_config_contents,
             })
         }) {
@@ -10291,7 +10224,6 @@ pub fn extract_relay_common_config(
             &format!("提取通用配置失败：{error}"),
             ExtractRelayCommonConfigPayload {
                 common_config_contents: String::new(),
-                context_config_contents: String::new(),
                 profile_config_contents: request.config_contents,
             },
         ),
@@ -11466,7 +11398,10 @@ fn diagnostics_report() -> String {
         "generatedAtMs": generated_at_ms,
         "version": codex_plus_core::version::VERSION,
         "overview": overview.payload,
-        "settings": settings,
+        // 报告会被整段贴进 issue：设置里的 Key、登录 token 一律打码（#3129）。
+        "settings": codex_plus_core::diagnostic_redaction::redact_report_value(
+            serde_json::to_value(&settings).unwrap_or_default()
+        ),
         "logs": {
             "diagnosticLogPath": codex_plus_core::paths::default_diagnostic_log_path(),
             "latestStatusPath": codex_plus_core::paths::default_latest_status_path()
@@ -12351,48 +12286,6 @@ cwd = \"/tmp\"
     }
 
     #[test]
-    fn manager_preferences_save_validates_raw_shared_template_before_migration() {
-        let _guard = lock_codex_home_for_test();
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("settings.json");
-        let previous = codex_plus_core::paths::set_settings_path_for_tests(Some(path.clone()));
-        let store = SettingsStore::default();
-        store.save(&BackendSettings {
-            enhancements_enabled: false,
-            relay_context_config_contents: "[mcp_servers.keep]\ncommand = 'keep'\n".into(),
-            ..BackendSettings::default()
-        }).unwrap();
-        let before = std::fs::read(&path).unwrap();
-        let mut settings = store.load().unwrap();
-        for invalid in [
-            "description = 1\ndescription = 2", "[unterminated",
-            "'plugins'.example = {enabled = true}", "[ 'mcp_servers'.example ] # real",
-            "skills = { config = [] }",
-        ] {
-            settings.relay_common_config_contents = invalid.into();
-            let result = save_settings(settings.clone(), None);
-            assert_eq!(result.status, "failed", "{invalid}");
-            assert_eq!(std::fs::read(&path).unwrap(), before);
-        }
-        let template = "developer_instructions = '''\n[plugins.example]\n[plugins.example]\n'''\n[permissions.mine] # keep\ndescription = 'work'\n";
-        settings.relay_common_config_contents = template.into();
-        let result = save_settings(settings, None);
-        let saved = store.load().unwrap();
-        assert_eq!(result.status, "ok", "{}", result.message);
-        assert_eq!(saved.relay_common_config_contents, template);
-        assert_eq!(saved.relay_context_config_contents, "[mcp_servers.keep]\ncommand = 'keep'\n");
-        let mut legacy = saved;
-        legacy.relay_common_config_contents = "[unfinished\n".into();
-        store.save(&legacy).unwrap();
-        let mut other_change = store.load().unwrap();
-        other_change.provider_sync_enabled = !other_change.provider_sync_enabled;
-        let result = save_settings(other_change, None);
-        codex_plus_core::paths::set_settings_path_for_tests(previous);
-        assert_eq!(result.status, "ok", "{}", result.message);
-        assert_eq!(result.payload.settings.relay_common_config_contents, "[unfinished\n");
-    }
-
-    #[test]
     fn manager_preferences_save_preserves_the_latest_explicit_native_login() {
         let _guard = lock_codex_home_for_test();
         let temp = tempfile::tempdir().unwrap();
@@ -12584,6 +12477,17 @@ base_url = "https://example.invalid/v1"
         }
     }
 
+    /// #3191：首选端口被别的程序占着、Codex 实际跑在备用端口时，重启和停止要认备用端口。
+    #[test]
+    fn running_port_follows_the_owned_session_when_it_moved_off_the_requested_port() {
+        let alive = |port: u16| port == 51234;
+        assert_eq!(resolve_running_debug_port(9229, Some(51234), alive), 51234);
+        // 本进程没有会话、会话就在首选端口、或会话端口已经不通：都按首选端口。
+        assert_eq!(resolve_running_debug_port(9229, None, alive), 9229);
+        assert_eq!(resolve_running_debug_port(9229, Some(9229), alive), 9229);
+        assert_eq!(resolve_running_debug_port(9229, Some(40000), alive), 9229);
+    }
+
     #[test]
     fn restart_and_launch_share_a_single_flight_guard() {
         let first = try_acquire_launch_guard().unwrap();
@@ -12721,21 +12625,6 @@ base_url = "https://example.invalid/v1"
     }
 
     #[test]
-    fn dream_skin_image_payload_does_not_expose_image_bytes() {
-        let payload = DreamSkinImagePayload {
-            path: "managed/current.png".to_string(),
-            content_type: "image/png".to_string(),
-            size_bytes: 42,
-        };
-
-        let value = serde_json::to_value(payload).unwrap();
-
-        assert!(value.get("bytes").is_none());
-        assert_eq!(value["contentType"], "image/png");
-        assert_eq!(value["sizeBytes"], 42);
-    }
-
-    #[test]
     fn dream_skin_theme_library_payload_does_not_expose_image_bytes() {
         let settings = BackendSettings::default();
         let library = empty_dream_skin_library(&settings);
@@ -12763,28 +12652,28 @@ base_url = "https://example.invalid/v1"
     }
 
     #[test]
-    fn dream_skin_commands_are_registered_with_tauri() {
+    fn manager_registers_only_the_dream_skin_commands_it_still_calls() {
         let source =
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs")).unwrap();
 
         for command in [
-            "commands::dream_skin_status",
-            "commands::import_dream_skin_image",
-            "commands::reset_dream_skin_theme",
-            "commands::apply_dream_skin",
-            "commands::restore_dream_skin",
-            "commands::verify_dream_skin",
-            "commands::list_dream_skin_themes",
-            "commands::refresh_dream_skin_market",
-            "commands::install_dream_skin_market_theme",
-            "commands::load_dream_skin_theme",
-            "commands::create_dream_skin_theme",
-            "commands::save_dream_skin_theme",
-            "commands::rename_dream_skin_theme",
-            "commands::delete_dream_skin_theme",
-            "commands::activate_dream_skin_theme",
+            "commands::restore_dream_skin,",
+            "commands::load_pending_dream_skin_community,",
+            "commands::confirm_pending_dream_skin_community,",
+            "commands::dismiss_pending_dream_skin_community,",
+            "dream_skin_bridge::activate_installed_dream_skin_theme,",
         ] {
             assert!(source.contains(command), "missing Tauri command {command}");
+        }
+        // 皮肤的编辑、市场与社区都搬进了 Codex 设置页，经 /dream-skin 桥走，不再给管理器前端开口子。
+        for command in [
+            "commands::dream_skin_status,",
+            "commands::activate_dream_skin_theme,",
+            "commands::save_dream_skin_theme,",
+            "commands::install_dream_skin_market_theme,",
+            "commands::import_dream_skin_theme_package,",
+        ] {
+            assert!(!source.contains(command), "stale Tauri command {command}");
         }
     }
 
@@ -12797,23 +12686,6 @@ base_url = "https://example.invalid/v1"
         assert!(source.contains("Menu::with_items(&app, &[&show, &quit])"));
         assert!(!source.contains("tray_apply_dream_skin"));
         assert!(!source.contains("apply_dream_skin_from_tray"));
-    }
-
-    #[test]
-    fn dream_skin_theme_reset_rollback_preserves_unknown_settings_fields() {
-        let source =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/commands.rs"))
-                .unwrap();
-        let start = source.find("pub fn reset_dream_skin_theme").unwrap();
-        let end = source[start..]
-            .find("pub async fn verify_dream_skin")
-            .unwrap()
-            + start;
-        let reset_source = &source[start..end];
-
-        assert!(!reset_source.contains("store.save(&previous)"));
-        assert!(reset_source.contains("codexAppDreamSkinThemeConfig"));
-        assert!(reset_source.contains("codexAppDreamSkinImagePath"));
     }
 
     #[test]
@@ -14246,25 +14118,6 @@ enabled = true
     }
 
     #[test]
-    fn normalize_settings_before_save_preserves_distinct_tuning_override() {
-        let settings = BackendSettings {
-            relay_common_config_contents: "tool_output_token_limit = 4096\n".into(),
-            relay_profiles: vec![RelayProfile {
-                use_common_config: true,
-                config_contents: "tool_output_token_limit = 999\n".into(),
-                ..RelayProfile::default()
-            }],
-            ..BackendSettings::default()
-        };
-        let saved = normalize_settings_before_save(settings);
-        assert!(
-            saved.relay_profiles[0]
-                .config_contents
-                .contains("tool_output_token_limit = 999")
-        );
-    }
-
-    #[test]
     fn normalize_settings_before_save_strips_common_from_enabled_profile() {
         let settings = BackendSettings {
             relay_common_config_contents: r#"model_reasoning_effort = "high"
@@ -14280,15 +14133,10 @@ enabled = true
                 use_common_config: true,
                 config_contents: r#"model = "gpt-5"
 model_reasoning_effort = "high"
-developer_instructions = '''
-[plugins."superpowers@openai-curated"]
-model_reasoning_effort = "example"
-'''
 
 [features]
 goals = true
 model_reasoning_effort = "high"
-profile_only = true
 
 [plugins."superpowers@openai-curated"]
 enabled = true
@@ -14303,16 +14151,12 @@ enabled = true
         let config = &normalized.relay_profiles[0].config_contents;
 
         assert!(config.contains("model = \"gpt-5\""));
-        let doc = config.parse::<toml_edit::DocumentMut>().unwrap();
-        assert!(doc.get("model_reasoning_effort").is_none());
-        assert!(doc["features"].get("model_reasoning_effort").is_none());
-        assert_eq!(doc["features"]["profile_only"].as_bool(), Some(true));
-        assert_eq!(doc["developer_instructions"].as_str(), Some("[plugins.\"superpowers@openai-curated\"]\nmodel_reasoning_effort = \"example\"\n"));
+        assert!(!config.contains("model_reasoning_effort"));
         // `goals` is an explicit per-profile override and must survive
         // normalization even when it matches the common configuration.
         assert!(config.contains("[features]"));
         assert!(config.contains("goals = true"));
-        assert!(doc.get("plugins").is_none());
+        assert!(!config.contains("[plugins.\"superpowers@openai-curated\"]"));
     }
 
     #[test]

@@ -4,7 +4,7 @@ import { test } from "node:test";
 import vm from "node:vm";
 import ts from "typescript";
 import { modelSlugFromRowName, suffixWindowString } from "./model-metadata.ts";
-import { independentProxyEnabled, setIndependentProxyConfigured, requestCompatibilityEnabled, stripImageGenerationToolEnabled, stripResponsesImageDetailEnabled, pureApiImageGenerationEnabled, normalizeRelayModelRoutes } from "./model-routes.ts";
+import { independentProxyEnabled, setIndependentProxyConfigured, requestCompatibilityEnabled, stripImageGenerationToolEnabled, stripResponsesImageDetailEnabled, stripResponsesOutputEncryptedContentEnabled, pureApiImageGenerationEnabled, normalizeRelayModelRoutes } from "./model-routes.ts";
 import { sessionProviderForProtocol } from "./relay-session.ts";
 import { aggregateMemberCandidates, isAggregateProfile, isOfficialLoginMemberProfile } from "./aggregate-members.ts";
 import { relayProfileWithNormalizedApiKeys, relayProfileWithUpdatedApiKey } from "./provider-api-keys.ts";
@@ -29,7 +29,6 @@ const names = new Set([
   "tomlQuotedValue", "tomlDottedKeyPath", "tomlKeyPathName", "codexProviderSectionName",
   "tomlKeyAssignment", "tomlInlineComment",
   "tomlStructureMask",
-  "stripCommonConfigTextFallback", "commonConfigAnchors", "tomlRootKeyFromLine",
 ]);
 const helpers = app.statements.filter((node) =>
   ts.isFunctionDeclaration(node) && node.name && names.has(node.name.text));
@@ -41,7 +40,7 @@ const context = vm.createContext({
   exports: {},
   PROTOCOL_PROXY_BASE_URL: "http://127.0.0.1:57321/v1",
   CHAT_UPSTREAM_BASE_URL_KEY: "codex_plus_chat_base_url",
-  requestCompatibilityEnabled, stripImageGenerationToolEnabled, stripResponsesImageDetailEnabled, pureApiImageGenerationEnabled, independentProxyEnabled, normalizeRelayModelRoutes, sessionProviderForProtocol, modelSlugFromRowName, suffixWindowString,
+  requestCompatibilityEnabled, stripImageGenerationToolEnabled, stripResponsesImageDetailEnabled, stripResponsesOutputEncryptedContentEnabled, pureApiImageGenerationEnabled, independentProxyEnabled, normalizeRelayModelRoutes, sessionProviderForProtocol, modelSlugFromRowName, suffixWindowString,
   aggregateMemberCandidates, isAggregateProfile, isOfficialLoginMemberProfile,
   relayProfileWithUpdatedApiKey, resolveProviderName, tomlSectionStringValue,
 });
@@ -151,41 +150,35 @@ test("file editors can clear the selected key without restoring a backup", () =>
   }
 });
 
-test("file editors preserve rotated credentials and profile overrides against the draft template", () => {
+test("file editor callbacks keep rotated credentials through profile normalization", () => {
   const editors = app.statements.find((node) => ts.isFunctionDeclaration(node) && node.name?.text === "RelayFileEditors")!;
-  const compiled = ts.transpileModule(editors.getText(app), {
-    compilerOptions: { target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.React, jsxFactory: "element" },
-  }).outputText;
-  const inputs = new Map<string, (text: string) => void>();
-  const commonContents = "compact_prompt = 'shared'\n";
-  const original = relayProfileWithNormalizedApiKeys(context.deriveRelayProfileFromFiles(profile(false)));
-  const render = vm.runInNewContext(`${compiled}; RelayFileEditors`, {
-    ...context, t: String, RelayFold: "fold", RelayCommonConfigEditor: "common", SyncedTextarea: "input", Button: "button", Download: "icon",
-    element: (type: string, props: any) => {
-      if (type === "input") inputs.set(props.value, props.onValueChange);
-      return { type, props };
-    },
-    contextEntriesForProfile: () => [], stripContextEntriesFromConfig: (text: string) => text,
-    relayCombinedCommonConfig: (settings: any) => settings.relayCommonConfigContents,
-    effectiveRelayConfigPreview: (profile: typeof original, settings: any) => settings.relayCommonConfigContents + profile.configContents,
-  });
-  let edited: typeof original | undefined;
-  for (const saving of [true, false]) {
-    const tree = render({ profile: original, commonContents, saving, form: { relayCommonConfigContents: "tool_output_token_limit = 4000" },
-      onProfileChange: (value: typeof original) => { edited = value; } });
-    assert.equal(tree.type, "fieldset");
-    assert.equal(tree.props.disabled, saving);
-  }
-  for (const input of [commonContents + original.configContents, original.authContents]) {
-    const config = input !== original.authContents;
-    inputs.get(input)!((config ? "tool_output_token_limit = 2000\n" : "") + input.replace("fixture-provider-key", "fixture-rotated-key"));
+  const handlers = new Map<string, string>();
+  const visit = (node: ts.Node) => {
+    if (ts.isJsxAttribute(node) && node.name.getText(app).replace(/^export /, "") === "onValueChange"
+      && node.initializer && ts.isJsxExpression(node.initializer)) {
+      const value = node.parent.properties.find((attr) => ts.isJsxAttribute(attr) && attr.name.getText(app).replace(/^export /, "") === "value");
+      if (value && ts.isJsxAttribute(value) && value.initializer && ts.isJsxExpression(value.initializer)) {
+        handlers.set(value.initializer.expression!.getText(app).replace(/^export /, ""), node.initializer.expression!.getText(app).replace(/^export /, ""));
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(editors);
+  for (const field of ["configPreview", "profile.authContents"]) {
+    const original = relayProfileWithNormalizedApiKeys(context.deriveRelayProfileFromFiles(profile(false)));
+    let edited: typeof original | undefined;
+    const compiled = ts.transpileModule(`const handler = ${handlers.get(field)};`, {
+      compilerOptions: { target: ts.ScriptTarget.ES2022 },
+    }).outputText;
+    const handler = new Function("profile", "onProfileChange", "deriveRelayProfileFromFiles",
+      "stripCommonConfigTextFallback", "relayCombinedCommonConfig", "stripContextEntriesFromConfig", "entries", "form",
+      `${compiled}; return handler;`)(original, (value: typeof original) => { edited = value; },
+        context.deriveRelayProfileFromFiles, (value: string) => value, () => "", (value: string) => value, {}, {});
+    handler(field === "configPreview"
+      ? original.configContents.replace("fixture-provider-key", "fixture-rotated-key")
+      : original.authContents.replace("fixture-provider-key", "fixture-rotated-key"));
     assert.ok(edited);
     assert.equal(relayProfileWithNormalizedApiKeys(edited).apiKey, "fixture-rotated-key");
-    if (config) {
-      assert.match(edited.configContents, /^tool_output_token_limit = 2000$/m);
-      assert.doesNotMatch(edited.configContents, /compact_prompt/);
-    }
-    edited = undefined;
   }
 });
 

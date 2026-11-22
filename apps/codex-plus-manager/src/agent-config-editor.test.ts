@@ -21,9 +21,28 @@ function nodes(tree: any): any[] {
   return [tree, ...nodes(tree.props.children)];
 }
 
-test("Pi 配置弹窗读取原文，保存失败保留草稿，成功才关闭", async (t) => {
+function screenHooks() {
   const state: any[] = [];
   let cursor = 0;
+  return {
+    useState(initial: unknown) {
+      const index = cursor++;
+      if (!(index in state)) state[index] = initial;
+      return [state[index], (value: unknown) => { state[index] = value; }];
+    },
+    useEffect(effect: () => void) {
+      const index = cursor++;
+      if (!state[index]) { state[index] = true; effect(); }
+    },
+    render(component: () => unknown) {
+      cursor = 0;
+      return nodes(component());
+    },
+  };
+}
+
+test("Pi 配置弹窗读取原文，保存失败保留草稿，成功才关闭", async (t) => {
+  const hooks = screenHooks();
   const close = t.mock.fn();
   const draft = '{"theme":"dark"}';
   const saveArgs = { agent: "pi", original: { source: "pi", contents: "{}" }, contents: draft };
@@ -38,13 +57,8 @@ test("Pi 配置弹窗读取原文，保存失败保留草稿，成功才关闭",
     "react/jsx-runtime": jsxRuntime,
     "react-dom": { createPortal: (child: unknown) => child },
     react: {
+      ...hooks,
       createContext: () => null, useId: () => "editor", useRef: () => ({ current: null }),
-      useState: (initial: unknown) => {
-        const index = cursor++;
-        if (!(index in state)) state[index] = initial;
-        return [state[index], (value: unknown) => { state[index] = value; }];
-      },
-      useEffect: (effect: () => void) => { const index = cursor++; if (!state[index]) { state[index] = true; effect(); } },
     },
     "./i18n": translate,
     "./use-escape-layer": { useEscapeLayer() {} }, "./use-modal-focus": { useModalFocus() {} },
@@ -53,10 +67,7 @@ test("Pi 配置弹窗读取原文，保存失败保留草稿，成功才关闭",
   };
   const context = vm.createContext({ exports: {}, document: { body: {} }, require: (name: string) => modules[name] });
   vm.runInContext(dialogCode, context);
-  const render = () => {
-    cursor = 0;
-    return nodes(context.exports.AgentConfigDialog({ agent: "pi", name: "Pi", onClose: close }));
-  };
+  const render = () => hooks.render(() => context.exports.AgentConfigDialog({ agent: "pi", name: "Pi", onClose: close }));
   const textarea = () => render().find((item) => item.type === "textarea").props;
   const save = () => render().find((item) => item.props.children === "保存").props;
   render();
@@ -76,8 +87,12 @@ test("Pi 配置弹窗读取原文，保存失败保留草稿，成功才关闭",
 });
 
 const appBody = app.statements.filter(ts.isFunctionDeclaration).find((node) => node.name?.text === "App")!.body!;
-const commonHook = app.statements.filter(ts.isFunctionDeclaration).find(node => node.name?.text === "useRelayCommonConfig")!.getText(app);
-const templateDraft = 'developer_instructions = """\n示例表头：\n[mcp_servers.example]\n这仍然是普通文本。\n"""\n';
+function appInitializer(name: string) {
+  return appBody.statements.filter(ts.isVariableStatement)
+    .flatMap(statement => [...statement.declarationList.declarations])
+    .find(decl => decl.name.getText(app) === name)!.initializer!.getText(app);
+}
+
 test("从 Agent 接入打开 Codex 时定位到通用配置，其他 Agent 仍开自己的弹窗", () => {
   function provider(node: ts.Node): ts.JsxOpeningElement | undefined {
     if (ts.isJsxOpeningElement(node) && node.tagName.getText(app) === "OpenAgentConfig.Provider") return node;
@@ -94,112 +109,71 @@ test("从 Agent 接入打开 Codex 时定位到通用配置，其他 Agent 仍�
   assert.deepEqual(calls, [true, { agent: "pi", name: "Pi" }]);
 });
 
-test("通用配置拒绝过期草稿；保存失败保留原文，成功后才提示生效条件", async () => {
-  const opened = "tool_output_token_limit = 2000";
-  let edit: { original: string; text: string } | null = { original: opened, text: templateDraft };
-  const settings = { activeRelayId: "codex-plus-gateway", relayCommonConfigContents: opened };
-  const writes: unknown[] = [];
-  const context = vm.createContext({
-    ...translate, useState: () => [edit, (next: typeof edit) => { edit = next; }],
-    settingsRef: { current: { status: "ok", settings } }, isSuccessStatus: (status: string) => status === "ok",
-    run: (task: () => unknown) => task(), normalizeSettings: (value: unknown) => value, acceptExternalSettings() {},
-    call: (command: string, args: { settings: typeof settings }) => {
-      writes.push([command, structuredClone(args.settings)]);
-      return { status: "ok", settings: args.settings };
-    },
-  });
-  vm.runInContext(appFunctions(["saveCommonTemplate"]), context);
-  const useEditor = vm.runInContext(compile(`(${commonHook})`), context);
+test("Codex 模板保存冲突时保留草稿，不重试，成功后才提示生效条件", async () => {
+  const opened = "tool_output_token_limit = 2000\n";
+  const draft = "[permissions.work]\ndescription = 'work'\n";
+  const settings = {
+    revision: "r1", activeRelayId: "external-provider", relayCommonConfigContents: opened, theme: "saved",
+    relayProfiles: [],
+  };
+  let form = { ...settings, theme: "unsaved" };
+  let persisted = settings;
+  const writes: { settings: typeof settings; expectedRevision: string }[] = [];
   const notices: string[] = [];
-  const editor = (original: string) => useEditor(original, {
-    saveCommonTemplate: context.saveCommonTemplate,
-    showMessage: (_title: string, message: string) => notices.push(message),
-  });
-  assert.equal(await editor("").save(), null);
-  await editor(opened).save((text: string) => { assert.equal(text, templateDraft); return null; });
-  assert.equal(editor(opened).contents, templateDraft);
-  assert.deepEqual(notices, []);
-  await editor(opened).save();
-  assert.deepEqual(writes, [["save_settings", { ...settings, relayCommonConfigContents: templateDraft }]]);
-  assert.equal(editor(opened).dirty, false);
-  assert.match(notices[0], /重新应用或切换到使用通用配置的供应商后生效/);
-});
-
-function onboardingCheck(node: ts.Node): string | undefined {
-  if (ts.isJsxAttribute(node) && node.name.getText(app) === "onCheckCodex"
-    && node.initializer && ts.isJsxExpression(node.initializer)) return node.initializer.expression?.getText(app);
-  return ts.forEachChild(node, onboardingCheck);
-}
-const checkHandler = onboardingCheck(appBody);
-assert.ok(checkHandler);
-const checkCode = compile(`globalThis.checkEnhancements = ${checkHandler};`);
-const appFunctions = (names: string[]) => compile(appBody.statements.filter(ts.isVariableStatement)
-  .flatMap((statement) => [...statement.declarationList.declarations])
-  .filter((decl) => ["rebaseConfigDraft", ...names].includes(decl.name.getText(app))).map((decl) => `globalThis.${decl.name.getText(app)} = ${decl.initializer!.getText(app)};`).join("\n"));
-
-async function checkPendingSave(scenario: "autosave" | "refresh" | "conflict") {
-  const editConfig = scenario === "conflict";
-  const oldConfig = 'model = "a"\ntool_output_token_limit = 4096\n';
-  const cleanConfig = 'model = "a"\n';
-  const old = { activeRelayId: "A", revision: "r1", relayCommonConfigContents: "tool_output_token_limit = 4096\n", relayProfiles: [
-    { id: "A", name: "A", configContents: oldConfig }, { id: "B", name: "B", configContents: "" },
-  ] };
-  const latest = { ...old, revision: "r2", relayCommonConfigContents: "", relayProfiles: [
-    { ...old.relayProfiles[0], configContents: cleanConfig }, old.relayProfiles[1],
-  ] };
-  let form = { ...old, relayProfiles: [
-    { ...old.relayProfiles[0], configContents: editConfig ? oldConfig + "user_edit = true\n" : oldConfig },
-    { ...old.relayProfiles[1], name: "renamed B" },
-  ] };
-  let disk = latest;
-  let release!: () => void;
-  const conflict = new Promise<void>((resolve) => { release = resolve; });
+  const hooks = screenHooks();
   const context = vm.createContext({
-    settingsRef: { current: { settings: old } }, normalizeSettings: (value: unknown) => value,
-    backendSettingsEqual: (left: unknown, right: unknown) => JSON.stringify(left) === JSON.stringify(right),
-    relayFilesRead: { current: 0 }, setRelayFiles: (value: unknown) => assert.equal(value, null), stringifyError: String,
-    run: (task: () => Promise<unknown>) => task(), setOverview: () => {}, hasCodexEnhancements: () => true,
-    rebaseSettingsEdits, mergeRotatedAuthContents, isSuccessStatus: (status: string) => status === "ok",
-    setSettings: (result: { settings: typeof old }) => { context.settingsRef.current = result; },
-    setSettingsForm: (update: (current: typeof old) => typeof old) => { form = update(form); },
-    invoke: async (command: string, args?: { expectedRevision: string; settings: typeof old }) => {
-      if (command === "load_overview") return { status: "ok", codex_app: { status: "found" } };
-      if (command === "load_settings") return { status: "ok", settings: disk };
+    ...translate,
+    useState: hooks.useState, useEffect: hooks.useEffect, exports: {}, require: () => jsxRuntime,
+    Button: "button", Save: "svg", SyncedTextarea: "textarea", stringifyError: String,
+    settingsRef: { current: { status: "ok", settings } }, isSuccessStatus: (status: string) => status === "ok",
+    run: async (task: () => unknown) => {
+      try { return await task(); } catch (error) { notices.push(String(error)); return null; }
+    },
+    normalizeSettings: (value: unknown) => value, mergeRotatedAuthContents, rebaseSettingsEdits,
+    setSettings() {},
+    setSettingsForm: (update: (value: typeof settings) => typeof settings) => { form = update(form); },
+    showNotice: (_title: string, message: string, status: string) => notices.push(`${status}: ${message}`),
+    invoke: async (command: string, args: { draft?: string; settings: typeof settings; expectedRevision: string }) => {
+      if (command === "read_relay_common_config") {
+        if (args?.draft === "[bad") throw new Error("TOML 格式无效");
+        return structuredClone(persisted);
+      }
       assert.equal(command, "save_settings");
-      if (args!.expectedRevision !== disk.revision) {
-        await conflict;
+      writes.push(structuredClone(args));
+      if (writes.length === 1) {
+        persisted = { ...settings, revision: "r2", activeRelayId: "another-provider" };
         return { status: "failed", message: "settings_revision_conflict" };
       }
-      disk = { ...args!.settings, revision: "r3" };
-      return { status: "ok", settings: disk };
+      persisted = { ...args.settings, revision: "r3" };
+      return { status: "ok", settings: persisted };
     },
   });
-  vm.runInContext(appFunctions(["call", "acceptExternalSettings", "autoSaveSettings", "retrySaveSettingsAfterConflict"]), context);
-  vm.runInContext(checkCode, context);
-  if (scenario === "autosave") {
-    const pending = context.autoSaveSettings(form);
-    const renamed = { ...form.relayProfiles[1], name: "B after submit" };
-    form = { ...form, relayProfiles: [form.relayProfiles[0], renamed] };
-    release();
-    assert.equal((await pending).status, "saved");
-    assert.deepEqual(structuredClone(form), { ...latest, revision: "r3", relayProfiles: [latest.relayProfiles[0], renamed] });
-  } else {
-    const pending = context.call("save_settings", { settings: form });
-    context.acceptExternalSettings({ status: "ok", settings: latest });
-    assert.equal(await context.checkEnhancements(), true);
-    assert.equal(form.revision, editConfig ? "r1" : "r2");
-    release();
-    if (editConfig) {
-      await assert.rejects(pending, /settings_revision_conflict/);
-      assert.deepEqual(disk, latest);
-      assert.match(form.relayProfiles[0].configContents, /user_edit = true/);
-      return;
-    }
-    await pending;
-  }
-  assert.deepEqual(structuredClone(disk), { ...latest, revision: "r3", relayProfiles: [latest.relayProfiles[0], { ...old.relayProfiles[1], name: "renamed B" }] });
-}
+  const page = app.statements.filter(ts.isFunctionDeclaration).find(node => node.name?.text === "RelayCommonConfigScreen")!;
+  const screen = vm.runInContext(compile(`(${page.getText(app)})`), context);
+  const save = vm.runInContext(compile(`(${appInitializer("saveCommonTemplate")})`), context);
+  const render = () => hooks.render(() => screen({ onSave: save }));
+  const textarea = () => render().find(node => node.type === "textarea").props;
+  const button = () => render().find(node => node.type === "button" && Array.isArray(node.props.children)).props;
+  const clickSave = async () => { button().onClick(); await settle(); };
 
-test("在途保存保留后续改名，刷新后不恢复旧配置，也不覆盖冲突草稿", async () => {
-  for (const scenario of ["autosave", "refresh", "conflict"] as const) await checkPendingSave(scenario);
+  render();
+  await settle();
+  assert.equal(textarea().value, opened);
+  textarea().onValueChange("[bad");
+  await clickSave();
+  assert.equal(writes.length, 0);
+  assert.match(notices.at(-1)!, /TOML/);
+  textarea().onValueChange(draft);
+  await clickSave();
+  assert.equal(writes.length, 1);
+  assert.equal(textarea().value, draft);
+  assert.match(notices.at(-1)!, /^failed: settings_revision_conflict$/);
+
+  await clickSave();
+  assert.deepEqual(writes.map(write => write.expectedRevision), ["r1", "r2"]);
+  assert.equal(writes[1].settings.activeRelayId, "another-provider");
+  assert.equal(writes[1].settings.relayCommonConfigContents, draft);
+  assert.equal(form.theme, "unsaved");
+  assert.match(notices.at(-1)!, /^ok: .*请重新应用使用通用配置的供应商/);
+  assert.equal(button().disabled, true);
 });

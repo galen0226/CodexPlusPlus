@@ -7,7 +7,7 @@ import { t, tf } from "./i18n";
 import { appConfirm } from "./app-dialog";
 import { modelSlugFromRowName } from "./model-metadata";
 import { AgentDisconnectDialog } from "./AgentDisconnectDialog";
-import { AgentConfigButton } from "./AgentConfigEditor";
+import { AgentConfigButton, OpenAgentConfig } from "./AgentConfigEditor";
 import { agentDiagnosticPresentation, canReconnectAgent, diagnosticErrorLabel, diagnosticEvidenceLabel } from "./gateway-agent-safety";
 import {
   agentModels,
@@ -88,7 +88,7 @@ export function AgentsView({
   run: Run;
   notify: Notify;
   onManage: () => void;
-  onOpenCodexProviderSettings?: () => void;
+  onOpenCodexProviderSettings?: (addDirectProvider?: boolean) => void;
   /** Codex 行的启动 / 停止：不传（比如总览里的接入弹窗）就不显示那个键。 */
   codexRun?: CodexRunControls;
 }) {
@@ -159,11 +159,12 @@ export function AgentConnectDialog({
   run: Run;
   notify: Notify;
   onManage: () => void;
-  onOpenCodexProviderSettings?: () => void;
+  onOpenCodexProviderSettings?: (addDirectProvider?: boolean) => void;
   onClose: () => void;
 }) {
   // Esc 栈：里面的下拉、确认框开着时 Esc 先关它们，不会连带关掉这个弹窗。
   useEscapeLayer(true, onClose);
+  const openConfig = useContext(OpenAgentConfig);
   return (
     <div className="gw-modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <div aria-label={t("接入 Agent")} className="gw-modal gw-agent-modal" role="dialog">
@@ -172,7 +173,12 @@ export function AgentConnectDialog({
           <button aria-label={t("关闭")} className="gw-icon-button" onClick={onClose} type="button"><X className="h-4 w-4" /></button>
         </header>
         <div className="gw-modal-body gw-agent-modal-body">
-          <AgentsView busy={busy} notify={notify} onManage={onManage} onOpenCodexProviderSettings={onOpenCodexProviderSettings} payload={payload} run={run} />
+          <OpenAgentConfig.Provider value={openConfig && (target => {
+            if (target.agent === "codex") onClose();
+            openConfig(target);
+          })}>
+            <AgentsView busy={busy} notify={notify} onManage={onManage} onOpenCodexProviderSettings={onOpenCodexProviderSettings} payload={payload} run={run} />
+          </OpenAgentConfig.Provider>
         </div>
       </div>
     </div>
@@ -198,7 +204,7 @@ function AgentRow({
   expanded: boolean;
   onToggleExpand: () => void;
   onManage: () => void;
-  onOpenCodexProviderSettings?: () => void;
+  onOpenCodexProviderSettings?: (addDirectProvider?: boolean) => void;
   run: Run;
   notify: Notify;
 }) {
@@ -354,7 +360,7 @@ function AgentRow({
                   <>
                     <span>{t("供应商配置切换已关闭，在供应商配置页打开后才能切换")}</span>
                     {onOpenCodexProviderSettings ? (
-                      <button className="gw-link gw-drift-reconnect" onClick={onOpenCodexProviderSettings} type="button">
+                      <button className="gw-link gw-drift-reconnect" onClick={() => onOpenCodexProviderSettings()} type="button">
                         {t("打开供应商页")}
                       </button>
                     ) : null}
@@ -441,6 +447,7 @@ function AgentRow({
       ) : null}
       {disconnectTarget ? (
         <AgentDisconnectDialog
+          onAddDirectProvider={onOpenCodexProviderSettings && (() => onOpenCodexProviderSettings(true))}
           agent={agent}
           busy={busy !== null}
           onApply={(previewToken) => disconnectTarget === "disconnect"

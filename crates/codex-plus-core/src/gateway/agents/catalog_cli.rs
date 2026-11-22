@@ -21,7 +21,7 @@ use crate::gateway::agents::catalog_core::{
 use crate::gateway::agents::files::{parse_jsonc, yaml_block};
 use crate::gateway::agents::{
     AgentEnv, AgentSpec, AgentWire, FileSet, ModelEntry, Os, PROVIDER_ID, PROVIDER_NAME,
-    PreferenceKind, Preferences, Wiring, YamlDoc, object_entry,
+    Preferences, Wiring, YamlDoc, object_entry,
 };
 
 pub static SPECS: &[AgentSpec] = &[
@@ -75,7 +75,7 @@ fn abs_dir_var(env: &AgentEnv, names: &[&str]) -> Option<PathBuf> {
 }
 
 /// 当前毫秒时间戳（OpenChamber 的偏好项要带）。
-pub(super) fn now_ms() -> u64 {
+fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
@@ -500,10 +500,7 @@ fn write_openchamber(env: &AgentEnv, wiring: &Wiring, set: &mut FileSet) -> anyh
 
 pub const OPENCHAMBER: AgentSpec = AgentSpec {
     id: "openchamber",
-    preferences: Preferences::Editable {
-        section: None,
-        fields: &[("theme", PreferenceKind::Text)],
-    },
+    preferences: Preferences::ReadOnly,
     name: "OpenChamber",
     binary: "openchamber",
     wire: AgentWire::Chat,

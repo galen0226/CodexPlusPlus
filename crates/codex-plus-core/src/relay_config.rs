@@ -1066,7 +1066,16 @@ pub fn apply_relay_profile_with_preservation(
     proxy_port: u16,
     preserve_nonprovider: bool,
 ) -> anyhow::Result<RelayApplyResult> {
-    apply_profile_with_fallback(home, profile, common, proxy_port, preserve_nonprovider, None)
+    if !preserve_nonprovider {
+        return apply_relay_profile_to_home_with_switch_rules_and_proxy_port(home, profile, common, proxy_port);
+    }
+    let mut effective = profile.clone();
+    let config = if profile.use_common_config {
+        merge_common_config_into_config(&profile.config_contents, &prepare_common_config_for_apply(common)?)?
+    } else { profile.config_contents.clone() };
+    effective.config_contents = preserve_live_nonprovider_settings(home, &config)?;
+    effective.use_common_config = false;
+    apply_relay_profile_to_home_with_switch_rules_and_proxy_port(home, &effective, common, proxy_port)
 }
 
 /// 多开实例专用（issue #2794）：把纯 API 供应商整理成「只用供应商 Key」的形态。
@@ -1168,34 +1177,11 @@ pub fn apply_relay_profile_to_home_with_switch_rules_and_proxy_port(
     common_config_contents: &str,
     proxy_port: u16,
 ) -> anyhow::Result<RelayApplyResult> {
-    apply_profile_with_fallback(home, profile, common_config_contents, proxy_port, false, None)
-}
-
-pub(crate) fn apply_profile_with_fallback(
-    home: &Path,
-    profile: &RelayProfile,
-    common_config_contents: &str,
-    proxy_port: u16,
-    preserve_nonprovider: bool,
-    official_fallback: Option<&str>,
-) -> anyhow::Result<RelayApplyResult> {
-    let mut effective;
-    let profile = if preserve_nonprovider {
-        effective = profile.clone();
-        let config = if profile.use_common_config {
-            merge_common_config_into_config(&profile.config_contents, &prepare_common_config_for_apply(common_config_contents)?)?
-        } else { profile.config_contents.clone() };
-        effective.config_contents = preserve_live_nonprovider_settings(home, &config)?;
-        effective.use_common_config = false;
-        &effective
-    } else { profile };
-    let profile = &crate::native_auth::resolve_profile_credentials(profile)?;
+    let resolved_profile = crate::native_auth::resolve_profile_credentials(profile)?;
+    let profile = &resolved_profile;
     let previous_model = live_root_model(home);
-    let result = if profile.relay_mode == RelayMode::Official && !profile.official_mix_api_key {
-        apply_official_profile_to_home(home, profile, common_config_contents, official_fallback)?
-    } else {
-        apply_relay_profile_to_home_inner(home, profile, common_config_contents, proxy_port)?
-    };
+    let result =
+        apply_relay_profile_to_home_inner(home, profile, common_config_contents, proxy_port)?;
     if profile.id != crate::gateway::apply::CODEX_GATEWAY_RELAY_ID {
         if let Err(error) =
             repair_managed_session_provider_in_home(home, ManagedSessionProviderScan::LegacyRollouts)
@@ -1234,6 +1220,9 @@ fn apply_relay_profile_to_home_inner(
     common_config_contents: &str,
     proxy_port: u16,
 ) -> anyhow::Result<RelayApplyResult> {
+    if profile.relay_mode == RelayMode::Official && !profile.official_mix_api_key {
+        return apply_official_profile_to_home(home, profile, common_config_contents);
+    }
     let profile = align_profile_model_with_active_goal_thread(home, profile);
     let profile = &profile;
     let selected_common = if profile.use_common_config {
@@ -2046,6 +2035,7 @@ fn recognized_managed_proxy_endpoint(profile: &RelayProfile, config: &str) -> bo
         || profile.strips_image_generation_tool()
         || profile.enables_pure_api_image_generation()
         || profile.strips_responses_image_detail()
+        || profile.strips_responses_output_encrypted_content()
         || profile.relay_mode == RelayMode::Aggregate;
     let saved_endpoint_matches = provider_string_from_config(&profile.config_contents, "base_url")
         .is_some_and(|saved| {
@@ -2150,6 +2140,31 @@ impl std::fmt::Display for LiveEndpointChanged {
 
 impl std::error::Error for LiveEndpointChanged {}
 
+/// 回填时实时配置里找不到有效的供应商 endpoint（`model_provider` 段缺 `base_url`、
+/// 指向不存在的段等）。和 [`LiveEndpointChanged`] 一样分不清实时文件归谁，自动回填只能停下；
+/// 但这份实时配置不该卡死后续切换（#2819、#3222：接入网关时报错里的是接入前的供应商，
+/// 删改目标供应商都绕不过去）。切换流程按同一类冲突处理，由用户/调用方显式放弃或导入。
+#[derive(Debug)]
+pub struct LiveEndpointMissing;
+
+impl std::fmt::Display for LiveEndpointMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "实时配置缺少有效的供应商 endpoint，已停止回填并保留原快照。请先显式导入完整上游 URL 与凭据，或确认当前登录模式后重试。",
+        )
+    }
+}
+
+impl std::error::Error for LiveEndpointMissing {}
+
+/// 回填因实时 endpoint 与供应商快照对不上而停下（改成了别的地址，或干脆缺失）。
+/// 这类错误不改动任何文件，切换流程可以让用户选择「导入为新供应商」或「放弃实时改动」。
+pub fn is_live_endpoint_conflict(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<LiveEndpointChanged>() || cause.is::<LiveEndpointMissing>())
+}
+
 fn validate_backfill_endpoint_identity(profile: &RelayProfile, config: &str) -> anyhow::Result<()> {
     if profile.relay_mode == RelayMode::Official && !profile.official_mix_api_key {
         return Ok(());
@@ -2169,9 +2184,11 @@ fn validate_backfill_endpoint_identity(profile: &RelayProfile, config: &str) -> 
         .as_deref()
         .is_some_and(valid_relay_endpoint)
     {
-        anyhow::bail!(
-            "实时配置缺少有效的供应商 endpoint，已停止回填并保留原快照。请先显式导入完整上游 URL 与凭据，或确认当前登录模式后重试。"
-        );
+        // TOML 本身坏了是语法问题，要用户先修，不能当成可放弃的归属冲突。
+        if parse_toml_document(config).is_err() {
+            anyhow::bail!("实时 config.toml 无法解析，已停止回填并保留原快照；请检查 TOML 语法后重试。");
+        }
+        return Err(LiveEndpointMissing.into());
     }
     if recognized_managed_proxy_endpoint(profile, config)
         || live_endpoint_matches_profile(profile, config)
@@ -2228,11 +2245,10 @@ fn sanitize_official_profile_table(table: &mut dyn TableLike) {
     }
 }
 
-fn apply_official_profile_to_home(
+pub(crate) fn apply_official_profile_to_home(
     home: &Path,
     profile: &RelayProfile,
     common_config: &str,
-    fallback: Option<&str>,
 ) -> anyhow::Result<RelayApplyResult> {
     normalize_relay_profile_for_storage(&mut profile.clone())?;
     let auth = (!profile.auth_contents.trim().is_empty()).then_some(profile.auth_contents.as_str());
@@ -2247,7 +2263,7 @@ fn apply_official_profile_to_home(
     ]
     .iter()
     .any(|value| !value.trim().is_empty());
-    if fallback.is_none() && profile.config_contents.trim().is_empty()
+    if profile.config_contents.trim().is_empty()
         && (!profile.use_common_config || common_config.trim().is_empty())
         && !has_explicit_model_settings
     {
@@ -2255,10 +2271,7 @@ fn apply_official_profile_to_home(
         return clear_relay_config_to_home_with_auth(home, auth);
     }
     let snapshot = if profile.config_contents.trim().is_empty() {
-        match fallback {
-            Some(text) => text.to_owned(),
-            None => read_optional_text(&home.join("config.toml"))?,
-        }
+        read_optional_text(&home.join("config.toml"))?
     } else {
         profile.config_contents.clone()
     };
@@ -3122,7 +3135,10 @@ fn parse_toml_document(contents: &str) -> anyhow::Result<DocumentMut> {
     if contents.trim().is_empty() {
         Ok(DocumentMut::new())
     } else {
-        crate::gateway::restore::parse_toml("config.toml", contents)
+        // 解析错误不带原文（那一行可能是 Key），只报行列。
+        contents.parse::<DocumentMut>().map_err(|error| {
+            crate::gateway::restore::toml_syntax_error("config.toml", contents, error.span())
+        })
     }
 }
 
@@ -3225,104 +3241,6 @@ pub fn normalize_config_text(contents: &str) -> String {
     normalize_duplicate_toml_text(contents)
 }
 
-const CONTEXT_ROOTS: [&str; 3] = ["mcp_servers", "skills", "plugins"];
-
-/// 新草稿须在迁移或去重前验证，不能把重复键修成另一份可保存的配置。
-pub fn validate_shared_config_draft(contents: &str) -> anyhow::Result<()> {
-    let doc = crate::gateway::restore::parse_toml("通用配置", contents)?;
-    for key in CONTEXT_ROOTS {
-        anyhow::ensure!(!doc.contains_key(key), "{key} 由独立页面管理，不能写入通用配置");
-    }
-    Ok(())
-}
-
-/// 将完整 TOML 按根键拆成共享模板和独立管理的上下文。旧版重复表先按原规则修复。
-pub fn split_context_config_sections(contents: &str) -> (String, String) {
-    let normalized = normalize_duplicate_toml_text(contents);
-    let Ok(mut common) = parse_toml_document(&normalized) else {
-        // 无法整体修复的旧设置仍按原规则迁移可识别的段落；新草稿不会走到这里。
-        let (mut common, mut context) = (Vec::new(), Vec::new());
-        let mut in_context = false;
-        for line in contents.lines() {
-            let header = line.trim();
-            if header.starts_with('[') && header.ends_with(']') {
-                in_context = header.starts_with("[mcp_servers.")
-                    || header.starts_with("[skills.")
-                    || header.starts_with("[plugins.");
-            }
-            if in_context {
-                context.push(line);
-            } else {
-                common.push(line);
-            }
-        }
-        return (
-            normalize_config_text(&common.join("\n")),
-            normalize_config_text(&context.join("\n")),
-        );
-    };
-    if !CONTEXT_ROOTS.iter().any(|key| common.contains_key(key)) {
-        return (normalized, String::new());
-    }
-    let mut context = DocumentMut::new();
-    for key in CONTEXT_ROOTS {
-        if let Some((key, item)) = common.as_table_mut().remove_entry(key) {
-            context.as_table_mut().insert_formatted(&key, item);
-        }
-    }
-    if common.is_empty() {
-        context.set_trailing(common.trailing().clone());
-        return (String::new(), normalize_optional_toml(context));
-    }
-    (normalize_optional_toml(common), normalize_optional_toml(context))
-}
-
-/// 两份配置各自从根开始；直接拼文本会把后一份的根键放进前一份的最后一个表。
-pub fn join_config_sections(first: &str, second: &str) -> String {
-    if first.trim().is_empty() {
-        return normalize_config_text(second);
-    }
-    if second.trim().is_empty() {
-        return normalize_config_text(first);
-    }
-    let first = normalize_config_text(first);
-    let second = normalize_config_text(second);
-    let (Ok(mut doc), Ok(mut other)) = (parse_toml_document(&first), parse_toml_document(&second)) else {
-        return normalize_config_text(&format!("{first}\n{second}"));
-    };
-    // toml_edit 按原文表头序号输出。两份文档都从零计数，追加的数组表必须排在原有条目后面。
-    fn shift_positions(table: &mut Table, offset: usize) {
-        if let Some(position) = table.position() {
-            table.set_position(position + offset);
-        }
-        for (_, item) in table.iter_mut() {
-            match item {
-                Item::Table(child) => shift_positions(child, offset),
-                Item::ArrayOfTables(entries) => {
-                    for child in entries.iter_mut() {
-                        shift_positions(child, offset);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    shift_positions(other.as_table_mut(), first.lines().count());
-    for (key, item) in other.iter() {
-        if let Some(existing) = doc.get_mut(key) {
-            merge_toml_item(existing, item);
-        } else {
-            doc.as_table_mut().insert_formatted(other.key(key).unwrap(), item.clone());
-        }
-    }
-    doc.set_trailing(format!(
-        "{}{}",
-        doc.trailing().as_str().unwrap_or_default(),
-        other.trailing().as_str().unwrap_or_default(),
-    ));
-    normalize_optional_toml(doc)
-}
-
 /// 把可能含重复表头/重复根键的文本，折叠成一份合法、去重的 TOML。
 ///
 /// 历史实现是逐行文本去重：按表头整行字符串匹配，撞见第二次出现的 `[header]`
@@ -3340,13 +3258,6 @@ pub fn join_config_sections(first: &str, second: &str) -> String {
 /// 任何一块解析失败就说明输入本身已经坏到不是逐块可解析的程度，退回历史的逐行
 /// 丢弃策略，不让这次修复反而让原本能跑的输入报错。
 fn normalize_duplicate_toml_text(contents: &str) -> String {
-    let contents = contents.trim_start_matches('\u{feff}');
-    if contents.trim().is_empty() {
-        return String::new();
-    }
-    if contents.parse::<DocumentMut>().is_ok() {
-        return ensure_trailing_newline(contents.to_string());
-    }
     match merge_duplicate_toml_blocks(contents) {
         Some(merged) => normalize_optional_toml(merged),
         None => normalize_duplicate_toml_text_line_fallback(contents),
@@ -3951,6 +3862,10 @@ fn preserve_live_app_settings(home: &Path, config_text: &str) -> anyhow::Result<
     // `[memories]`（记忆的提取/整合模型等）同样是用户在 Codex 里的本机设置，
     // 切换供应商或重启时不能被模板冲掉（#2021）。
     preserve_missing_table_keys(&mut target_doc, &live_doc, "memories");
+    // `[permissions.<名字>]` 权限档由用户自己维护，模板和通用配置都不管理它（#3016）。
+    // 切入的供应商快照里没有这张表、或只有通用配置里的旧副本时，档会整条消失或丢键，
+    // 根上的 `default_permissions` 却还指着它。live 有而目标缺的档整条补回，同名档只补缺的键。
+    preserve_missing_permission_profiles(&mut target_doc, &live_doc);
     // hooks 的定义部分（除 state 外的键）同样由用户/桌面端管理，模板里没有时
     // 从 live 补回，否则切换供应商会把定义整段丢掉，只剩 hooks.state。
     preserve_live_hook_definitions(&mut target_doc, &live_doc);
@@ -3991,6 +3906,19 @@ fn preserve_missing_table_keys(
             target_table.insert(key, value.clone());
         }
     }
+}
+
+fn preserve_missing_permission_profiles(target_doc: &mut DocumentMut, live_doc: &DocumentMut) {
+    let Some(live_profiles) = live_doc.get("permissions").filter(|item| item.is_table_like()) else {
+        return;
+    };
+    if target_doc.get("permissions").and_then(Item::as_table_like).is_none() {
+        // 只有 `[permissions.<名字>]` 子表，不单独写一行空的 `[permissions]`。
+        let mut profiles = toml_edit::Table::new();
+        profiles.set_implicit(true);
+        target_doc["permissions"] = Item::Table(profiles);
+    }
+    fill_missing_toml_item(&mut target_doc["permissions"], live_profiles);
 }
 
 /// 多开实例（#3144）：`[windows]`（Windows 沙箱实现 elevated / unelevated 等）以主实例
@@ -4534,6 +4462,79 @@ fn apply_external_catalog_fallback(
     normalize_optional_toml(doc)
 }
 
+/// 顶层 `model_context_window` / `model_auto_compact_token_limit` 与托管目录里逐模型值的取舍（#3168）。
+///
+/// Codex 里这两个顶层键对所有模型生效，并且压过目录里每个模型自己的 `context_window` /
+/// `auto_compact_token_limit`（真实 Codex 实测：目录写 1M、顶层 128000，显示「共 128k」）。
+/// 顶层值可能来自通用配置，也可能来自供应商级「上下文大小」「压缩上下文大小」。
+/// 只要有模型单独设了窗口（或压缩阈值），就把顶层值折进目录、作为其余模型的值，再从顶层去掉，
+/// 逐模型设置才生效；没有逐模型设置时保持原样（顶层单值行为不变）。
+struct TopLevelContextLimits {
+    /// 有模型单独设了不同的窗口时为顶层窗口值（要折进目录并去掉顶层键）。
+    window: Option<u64>,
+    /// 有模型单独设了压缩阈值时为顶层压缩值（要折进目录并去掉顶层键）。
+    compact: Option<u64>,
+}
+
+impl TopLevelContextLimits {
+    fn for_entries(config_text: &str, entries: &[crate::model_suffix::ModelCatalogEntry]) -> Self {
+        let read = |key: &str| {
+            root_positive_int_string(config_text, key).and_then(|value| value.parse::<u64>().ok())
+        };
+        let top_window = read("model_context_window");
+        let top_compact = read("model_auto_compact_token_limit");
+        let window = top_window.filter(|top| {
+            entries
+                .iter()
+                .any(|entry| entry.suffix_window.is_some_and(|window| window != *top))
+        });
+        let compact = top_compact
+            .filter(|_| entries.iter().any(|entry| entry.auto_compact_percent.is_some()));
+        Self { window, compact }
+    }
+
+    /// 没单独设窗口的模型用顶层窗口（与原先顶层对它们生效的结果一致）。
+    fn fallback_window(&self) -> Option<u64> {
+        self.window
+    }
+
+    /// 没单独设压缩阈值的模型写上顶层压缩值（原先顶层同样作用在它们身上）。
+    fn fold_compact_limit_into_catalog(
+        &self,
+        catalog_json: &str,
+        entries: &[crate::model_suffix::ModelCatalogEntry],
+    ) -> anyhow::Result<String> {
+        let Some(limit) = self.compact else {
+            return Ok(catalog_json.to_string());
+        };
+        let mut catalog: Value = serde_json::from_str(catalog_json)?;
+        let Some(models) = catalog.get_mut("models").and_then(Value::as_array_mut) else {
+            return Ok(catalog_json.to_string());
+        };
+        for model in models.iter_mut() {
+            let Some(slug) = model.get("slug").and_then(Value::as_str) else {
+                continue;
+            };
+            let has_own_percent = entries.iter().any(|entry| {
+                entry.slug.eq_ignore_ascii_case(slug) && entry.auto_compact_percent.is_some()
+            });
+            if !has_own_percent {
+                model["auto_compact_token_limit"] = json!(limit);
+            }
+        }
+        Ok(serde_json::to_string_pretty(&catalog)?)
+    }
+
+    fn remove_folded_keys(&self, doc: &mut DocumentMut) {
+        if self.window.is_some() {
+            doc.remove("model_context_window");
+        }
+        if self.compact.is_some() {
+            doc.remove("model_auto_compact_token_limit");
+        }
+    }
+}
+
 fn apply_model_catalog_to_config(
     home: &Path,
     profile: &RelayProfile,
@@ -4924,17 +4925,21 @@ fn apply_model_catalog_to_config_with_live_policy(
     if let Some(parent) = catalog_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let top_level = TopLevelContextLimits::for_entries(&config_text, &entries);
     // Lite 线格式跟随上游能力：仅官方登录态 + ChatGPT 后端保留模板原值，
     // 公开 API / 第三方中转一律关闭（标准 Responses），不再以 provider id 近似判断。
     let catalog_json = crate::model_suffix::build_model_catalog_json_with_capabilities(
         &entries,
-        fallback,
+        fallback.or(top_level.fallback_window()),
         None,
         (!lite_supported).then_some(false),
         official_deepseek_responses,
         provider_multi_agent,
     );
+    let catalog_json = top_level.fold_compact_limit_into_catalog(&catalog_json, &entries)?;
     let catalog_json = apply_model_metadata_overrides(&catalog_json, &model_metadata)?;
+    let catalog_json =
+        crate::gateway::opencode::apply_hy4_catalog_json_metadata(profile, &catalog_json)?;
     let catalog_json = if upstream_rejects_tool_search(profile) {
         disable_search_tool_in_catalog(&catalog_json)?
     } else {
@@ -4944,6 +4949,7 @@ fn apply_model_catalog_to_config_with_live_policy(
     crate::settings::atomic_write(&catalog_path, catalog_json.as_bytes())?;
     let mut doc = parse_toml_document(&config_text)?;
     doc["model_catalog_json"] = toml_edit::value(catalog_pointer);
+    top_level.remove_folded_keys(&mut doc);
     // #2683 验收 2：显式 v1 时必须压下 [features] multi_agent_v2——上游 schema 明言
     // 「An enabled features.multi_agent_v2 setting takes precedence」，闸门开着会单向
     // 覆盖目录里的经典协议声明，只写目录不够。这里写显式 false（false 不属于
@@ -6194,13 +6200,45 @@ fn sync_profile_mode_from_backfilled_live(profile: &mut RelayProfile) {
     }
 }
 
+/// 切到官方登录（含「官方 + API 混合」）供应商时要写进 live 的 auth.json。
+///
+/// 供应商里存的登录是上次回填时的快照。Codex 运行中会刷新登录并轮换 refresh token，所以同一个
+/// 账号在 live 里的那份比快照新，旧快照里的 refresh token 已经作废。几个供应商各存着同一账号的
+/// 旧快照时，照快照写回去，Codex 重开就要求重新登录（#3129）。
+/// 因此：live 里是同一个账号就沿用 live（快照的 `last_refresh` 更晚时除外，那是用户刚换上的）；
+/// live 是别的账号、没有登录或读不出来，照旧以快照为准。
 fn official_profile_auth_for_switch(home: &Path, auth_contents: &str) -> anyhow::Result<String> {
+    let live = read_optional_text(&home.join("auth.json"));
     let source = if auth_contents.trim().is_empty() {
-        read_optional_text(&home.join("auth.json"))?
+        live?
     } else {
-        auth_contents.to_string()
+        match live {
+            Ok(live)
+                if crate::native_auth::same_account(&live, auth_contents)
+                    && !login_was_refreshed_later(auth_contents, &live) =>
+            {
+                live
+            }
+            _ => auth_contents.to_string(),
+        }
     };
     remove_openai_api_key_from_auth_contents(&source)
+}
+
+/// 两份 auth.json 都带 `last_refresh` 且 `login` 的更晚（RFC 3339 的 UTC 时间戳按字面比较即可）。
+fn login_was_refreshed_later(login: &str, than: &str) -> bool {
+    let last_refresh = |contents: &str| {
+        serde_json::from_str::<Value>(contents)
+            .ok()?
+            .get("last_refresh")?
+            .as_str()
+            .map(|stamp| stamp.trim().to_string())
+            .filter(|stamp| !stamp.is_empty())
+    };
+    match (last_refresh(login), last_refresh(than)) {
+        (Some(login), Some(than)) => login > than,
+        _ => false,
+    }
 }
 
 /// 生成写入 live 的 auth.json 内容：把本地代理的 bearer token 放进 `OPENAI_API_KEY`，
@@ -6469,6 +6507,7 @@ pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
         || profile.strips_image_generation_tool()
         || profile.enables_pure_api_image_generation()
         || profile.strips_responses_image_detail()
+        || profile.strips_responses_output_encrypted_content()
         || has_managed_proxy_config
     {
         if !profile.upstream_base_url.trim().is_empty() {
@@ -6852,6 +6891,7 @@ fn complete_relay_profile_config_with_proxy_port(
         || profile.strips_image_generation_tool()
         || profile.enables_pure_api_image_generation()
         || profile.strips_responses_image_detail()
+        || profile.strips_responses_output_encrypted_content()
     {
         crate::protocol_proxy::local_responses_proxy_base_url(proxy_port)
     } else {
@@ -7391,24 +7431,37 @@ fn ensure_trailing_newline(mut contents: String) -> String {
 }
 
 fn move_model_providers_before_profiles(contents: &str) -> String {
-    let Ok(mut doc) = parse_toml_document(contents) else {
-        return ensure_trailing_newline(contents.to_owned());
+    let lines = contents.lines().collect::<Vec<_>>();
+    let Some(provider_start) = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("[model_providers."))
+    else {
+        return ensure_trailing_newline(contents.to_string());
     };
-    let first_profile = doc.get("profiles").and_then(Item::as_table).and_then(|profiles| {
-        profiles.iter().filter_map(|(_, item)| item.as_table()?.position()).min()
-    });
-    if let Some(position) = first_profile
-        && let Some(providers) = doc.get_mut("model_providers").and_then(Item::as_table_mut)
-    {
-        for (_, item) in providers.iter_mut() {
-            if let Some(provider) = item.as_table_mut()
-                && provider.position().is_some_and(|current| current > position)
-            {
-                provider.set_position(position.saturating_sub(1));
-            }
-        }
+    let provider_end = lines[provider_start + 1..]
+        .iter()
+        .position(|line| line.trim_start().starts_with('['))
+        .map(|offset| provider_start + 1 + offset)
+        .unwrap_or(lines.len());
+    let Some(profile_start) = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("[profiles."))
+    else {
+        return ensure_trailing_newline(contents.to_string());
+    };
+    if provider_start < profile_start {
+        return ensure_trailing_newline(contents.to_string());
     }
-    ensure_trailing_newline(doc.to_string())
+
+    let mut output = Vec::with_capacity(lines.len());
+    output.extend_from_slice(&lines[..profile_start]);
+    output.extend_from_slice(&lines[provider_start..provider_end]);
+    if output.last().is_some_and(|line| !line.trim().is_empty()) {
+        output.push("");
+    }
+    output.extend_from_slice(&lines[profile_start..provider_start]);
+    output.extend_from_slice(&lines[provider_end..]);
+    ensure_trailing_newline(output.join("\n"))
 }
 
 fn auth_json_chatgpt_account_label(path: &Path) -> Option<Option<String>> {
@@ -8204,26 +8257,6 @@ cwd = \"/tmp\"
 
         assert_eq!(doc["mcp_servers"]["node_repl"]["command"].as_str(), Some("node"));
         assert_eq!(doc["mcp_servers"]["node_repl"]["cwd"].as_str(), Some("/tmp"));
-    }
-
-    #[test]
-    fn normalize_config_text_preserves_multiline_headers_during_provider_ordering() {
-        let text = r#"developer_instructions = """
-[profiles.fake]
-[model_providers.fake]
-[model_providers.fake]
-"""
-[profiles.work]
-description = "live"
-[model_providers.real] # reorder this table only
-base_url = "fixture"
-"#;
-        let original = text.parse::<toml::Table>().unwrap();
-        let normalized = normalize_config_text(text);
-        assert_eq!(normalized, text);
-        let ordered = move_model_providers_before_profiles(&normalized);
-        assert_eq!(ordered.parse::<toml::Table>().unwrap(), original);
-        assert!(ordered.find("[model_providers.real]").unwrap() < ordered.find("[profiles.work]").unwrap());
     }
 
     /// 重复根键：后写覆盖前写，与 TOML 对同名键重复赋值时的直觉一致。

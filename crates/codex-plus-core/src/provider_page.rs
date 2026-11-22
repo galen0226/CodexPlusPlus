@@ -164,6 +164,7 @@ pub fn api_key_preview(key: &str) -> String {
 fn masked_profile_value(profile: &RelayProfile) -> anyhow::Result<Value> {
     let mut value = serde_json::to_value(profile)?;
     if let Some(object) = value.as_object_mut() {
+        object.remove("inactiveMixedApi");
         let keys = profile
             .api_keys
             .iter()
@@ -228,6 +229,28 @@ pub fn restore_masked_api_keys(profile: &mut Value, source: Option<&RelayProfile
         return;
     };
     object.remove("gatewayManaged");
+    if object.get("relayMode").and_then(Value::as_str) == Some("official")
+        && let Some(source) = source
+        && let Some(snapshot) = &source.inactive_mixed_api
+    {
+        if object.get("officialMixApiKey").and_then(Value::as_bool) != Some(true) {
+            object.insert("inactiveMixedApi".into(), json!(snapshot));
+        } else if source.relay_mode == RelayMode::Official && !source.official_mix_api_key {
+            let config = object.get("configContents").and_then(Value::as_str).unwrap_or_default();
+            if config.trim().is_empty() || config == source.config_contents {
+                object.insert("configContents".into(), json!(snapshot.config_contents));
+            }
+            let upstream = object.get("upstreamBaseUrl").and_then(Value::as_str).unwrap_or_default();
+            if upstream.is_empty() || upstream == source.upstream_base_url {
+                object.insert("upstreamBaseUrl".into(), json!(snapshot.upstream_base_url));
+                object.insert("baseUrl".into(), json!(snapshot.upstream_base_url));
+            }
+            if object.get("modelRoutes").is_none_or(|routes| *routes == json!(source.model_routes)) {
+                object.insert("modelRoutes".into(), json!(snapshot.model_routes));
+            }
+            object.remove("inactiveMixedApi");
+        }
+    }
     let Some(keys) = object.get_mut("apiKeys").and_then(Value::as_array_mut) else {
         return;
     };
@@ -369,6 +392,8 @@ fn normalized_for_compare(profile: &RelayProfile) -> Option<Value> {
     Some(value)
 }
 
+/// 当前供应商是聚合时，成员 / 路由 / 默认成员存在 `aggregate_relay_profiles` 里，不在供应商条目上，
+/// 要一并比较：改了当前聚合的成员（模型聚合的目录、同步的登录）同样要重新应用，与管理器保存当前供应商时一致。
 fn active_profile_changed(stored: &BackendSettings, next: &BackendSettings) -> bool {
     let find = |settings: &BackendSettings| {
         settings
@@ -377,8 +402,18 @@ fn active_profile_changed(stored: &BackendSettings, next: &BackendSettings) -> b
             .find(|profile| profile.id == stored.active_relay_id)
             .cloned()
     };
+    let aggregate = |settings: &BackendSettings| {
+        settings
+            .aggregate_relay_profiles
+            .iter()
+            .find(|aggregate| aggregate.id == stored.active_relay_id)
+            .cloned()
+    };
     match (find(stored), find(next)) {
-        (Some(before), Some(after)) => normalized_for_compare(&before) != normalized_for_compare(&after),
+        (Some(before), Some(after)) => {
+            normalized_for_compare(&before) != normalized_for_compare(&after)
+                || aggregate(stored) != aggregate(next)
+        }
         _ => true,
     }
 }

@@ -321,7 +321,7 @@ test("enhancement settings save automatically and show a permanent status at the
   const autoSave = appSource.slice(appSource.indexOf("const autoSaveSettings = async"), appSource.indexOf("const beginWeixinQrLogin"));
   assert.doesNotMatch(autoSave, /showNotice\(|dictationSettingsIssue/);
   assert.doesNotMatch(appSource, /dictationSettingsIssue/);
-  assert.match(autoSave, /keepOtherFields: !backendSettingsEqual\(current, snapshot\)/);
+  assert.match(autoSave, /backendSettingsEqual\(current, snapshot\) \? saved : \{ \.\.\.current, revision: saved\.revision \}/);
 });
 
 test("standalone quota unlock lives in its own group and stays editable when enhancements are off", () => {

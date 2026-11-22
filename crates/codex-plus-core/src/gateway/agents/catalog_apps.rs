@@ -933,7 +933,7 @@ fn air_dir(env: &AgentEnv) -> PathBuf {
     env.app_config().join("JetBrains").join("Air")
 }
 
-pub(super) fn air_opencode_config(env: &AgentEnv) -> PathBuf {
+fn air_opencode_config(env: &AgentEnv) -> PathBuf {
     air_dir(env).join("codexplus-opencode.json")
 }
 
@@ -974,7 +974,7 @@ fn air_write(env: &AgentEnv, wiring: &Wiring, set: &mut FileSet) -> anyhow::Resu
 
 pub const JETBRAINS_AIR: AgentSpec = AgentSpec {
     id: "jetbrains-air",
-    preferences: Preferences::OPENCODE,
+    preferences: Preferences::ReadOnly,
     name: "JetBrains Air",
     binary: "",
     wire: AgentWire::Chat,

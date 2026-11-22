@@ -14,7 +14,7 @@ import {
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import {
@@ -29,16 +29,13 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronRight,
-  Camera,
   CircleHelp,
   Copy,
   Download,
   Edit3,
-  Eye,
   GripVertical,
   Info,
   ScrollText,
-  ImagePlus,
   Github,
   GitBranch,
   ExternalLink,
@@ -54,7 +51,6 @@ import {
   Palette,
   Play,
   MessageCircle,
-  MoreHorizontal,
   PackageOpen,
   FileCode2,
   FolderOpen,
@@ -103,6 +99,7 @@ import {
 } from "lucide-react";
 import { createPresetPatch } from "@/components/ProviderPresetSelector";
 import { PRESETS, type ProviderPreset } from "./presets";
+import { setSponsorAds, useSponsorPresets } from "./sponsor-store";
 import { createPortal } from "react-dom";
 import { managerExtensionPages, managerNavPages, managerPageOverrides, type ManagerExtensionPage, type ManagerNavGroup, type ManagerPageSummary } from "./extension-manager-pages";
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from "react";
@@ -122,6 +119,7 @@ import {
   parseContextEntries,
   selectedContextConfigToml,
   setContextEntryEnabled,
+  splitContextConfigText,
   stripContextEntriesFromConfig,
   type CodexContextEntries,
   type CodexContextEntry,
@@ -140,9 +138,10 @@ import { MyPublishedPanel } from "./MyPublishedPanel";
 import { AgentIcon, SectionLabel, Switch } from "./gateway-ui";
 import { MAIN_WINDOW_READY_EVENT, parseTrayRequest, TRAY_REQUEST_EVENT, TRAY_RESULT_EVENT, type TrayRequest, type TrayResult } from "./tray-panel-model";
 import { AppSelect, type AppSelectOption } from "./AppSelect";
+import { DisplaySettings } from "./DisplaySettings";
 import { ExtensionConfigForm, type ExtensionConfigField } from "./extension-config-form";
 import { ExtensionManagerPanel } from "./ExtensionManagerPanel";
-import { AppDialogHost, appAlert, appConfirm, appPrompt } from "./app-dialog";
+import { AppDialogHost, appAlert, appConfirm } from "./app-dialog";
 import { GatewayPage, type GatewayTab } from "./GatewayPage";
 import { AgentGlyph, HubOverview, useGatewayPayload, useTodayUsage } from "./HubOverview";
 import { publishGatewayPayload } from "./gateway-store";
@@ -239,6 +238,7 @@ import {
   requestCompatibilityEnabled,
   stripImageGenerationToolEnabled,
   stripResponsesImageDetailEnabled,
+  stripResponsesOutputEncryptedContentEnabled,
   pureApiImageGenerationEnabled,
   findRelayModelRouteIssue,
   modelRouteSaveRequiresRestart,
@@ -296,26 +296,10 @@ import { isProviderSyncTargetSelectable, preferredProviderSyncTarget } from "./p
 import { resolveLaunchStatus, launchCompletionNotice } from "./launch-status";
 import {
   defaultDreamSkinTheme,
-  defaultDreamSkinColors,
-  isDreamSkinDraftDirty,
   normalizeDreamSkinTheme,
-  runExclusiveDreamSkinInstall,
-  type DreamSkinCheck,
-  type DreamSkinColors,
   type DreamSkinCommunityResult,
-  type DreamSkinCommunityTheme,
-  type DreamSkinImageResult,
-  type DreamSkinMarketResult,
-  type DreamSkinMarketTheme,
   type DreamSkinRuntimeResult,
-  type DreamSkinThemeActivationResult,
   type DreamSkinThemeConfig,
-  type DreamSkinThemeDraft,
-  type DreamSkinThemeDraftResult,
-  type DreamSkinThemeLibrary,
-  type DreamSkinThemeLibraryResult,
-  type DreamSkinThemeSummary,
-  type DreamSkinVerificationResult,
 } from "./dream-skin";
 import { subscribeLanguage, getLanguage, t, tf, toggleLanguage } from "@/i18n";
 import {
@@ -434,7 +418,6 @@ import { CxBadge, CxBanner, CxCard, CxEmpty, CxFilters, CxRow, CxSection, CxStat
 import { Puzzle } from "lucide-react";
 import * as AgentCx from "./cx-layout"; // cx-pages:agents：Agent 页面在函数内解构，避免和别的分组的具名导入重名
 
-const isWindowsPlatform = /\bWindows\b/i.test(navigator.userAgent);
 /// 增强设置项清单按平台过滤（例如桌宠跟随鼠标只在 Windows / macOS 显示）。
 const enhancementPlatform = enhancementPlatformFromUserAgent(navigator.userAgent);
 /// 会话维护页的两条开关与 Codex 设置页共用清单里的文案（#2846 拆开后分别显示）。
@@ -444,10 +427,6 @@ const sessionIndexRepairItem = enhancementItem("sessionIndexRepairEnabled");
 /// 多开启动后轮询「就绪/失败」结论的节奏：worker 最长等 90 秒就绪，这里给到 2 分钟。
 const MULTI_LAUNCH_POLL_INTERVAL_MS = 3000;
 const MULTI_LAUNCH_POLL_TIMEOUT_MS = 120_000;
-const dreamSkinWindowsPreviewUrl = new URL("../../../assets/inject/upstream/dream-skin/windows/dream-reference.jpg", import.meta.url).href;
-const dreamSkinMacPreviewUrl = new URL("../../../assets/inject/upstream/dream-skin/macos/portal-hero.png", import.meta.url).href;
-const dreamSkinCompanionDataUrlLimit = 240_000;
-const dreamSkinCompanionMimeTypes = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 
 type Status = "ok" | "failed" | "not_implemented" | "not_checked" | string;
 
@@ -467,18 +446,8 @@ type CommandResult<T> = T & {
 
 type PendingDreamSkinCommunityResult = CommandResult<{ versionId: string }>;
 
-type PendingDreamSkinRestart = {
-  currentThemeKey: string | null;
-  currentThemeName: string;
-  pendingThemeKey: string;
-  pendingThemeName: string;
-};
-
-type DreamSkinInstallOperation = {
-  source: "market" | "community" | "pending-community" | "import";
-  id: string;
-  name: string;
-};
+/// activate_installed_dream_skin_theme（dream_skin_bridge.rs）的结果：需要重启 Codex 才完整切换时 savedForNextLaunch 为 true。
+type DreamSkinInstalledThemeActivationResult = CommandResult<{ savedForNextLaunch?: boolean }>;
 
 type PathState = {
   status: string;
@@ -552,13 +521,6 @@ export type BackendSettings = WhaleBalanceSettings & {
   codexAppAutoTakeover: boolean;
   codexAppAutoTakeoverWhenActive: string;
   claudeAppExtensions?: boolean;
-  claudeAppVoiceInput?: boolean;
-  claudeAppLocalization?: boolean;
-  claudeAppComputerUse?: boolean;
-  claudeAppBashTimeout?: ClaudeBashTimeoutSettings;
-  computerUseMode?: string;
-  computerUseApproval?: string;
-  computerUsePip?: boolean;
   claudeDesktopLocal?: ClaudeLocalConfig;
   codexExtraArgs: string[];
   dictation: DictationSettings;
@@ -728,6 +690,7 @@ export type RelayProfile = {
   relayMode: RelayMode;
   sessionProvider?: RelaySessionProvider;
   officialMixApiKey: boolean;
+  inactiveMixedApi?: Pick<RelayProfile, "configContents" | "upstreamBaseUrl" | "modelRoutes">;
   officialAccountRef?: string;
   hideOfficialUsageAlert: boolean;
   testModel: string;
@@ -764,6 +727,8 @@ export type RelayProfile = {
   stripImageGenerationTool?: boolean;
   /** #2870：转发前移除 Responses 图片 `detail`，默认关闭。 */
   stripResponsesImageDetail?: boolean;
+  /** 转发前移除 Responses `include` 里的 `output.encrypted_content`，默认关闭。 */
+  stripResponsesOutputEncryptedContent?: boolean;
   /** #2868：不向上游发送 tool_search，默认关闭。 */
   disableToolSearch?: boolean;
   /** #1433：纯 API 下让 Codex 注册原生生图工具，生图请求经本地代理发给本供应商，默认关闭。 */
@@ -1065,7 +1030,6 @@ type LiveContextEntriesResult = CommandResult<{
 
 type ExtractRelayCommonConfigResult = CommandResult<{
   commonConfigContents: string;
-  contextConfigContents: string;
   profileConfigContents: string;
 }>;
 
@@ -1805,7 +1769,7 @@ export function App() {
   const [themePreference, setThemePreference] = useState<ThemePreference>(() => loadThemePreference());
   const [systemDark, setSystemDark] = useState(() => systemPrefersDark());
   const theme: Theme = resolveTheme(themePreference, systemDark);
-  const [route, setRoute] = useState<Route>(() => loadInitialRoute());
+  const [route, setRouteState] = useState<Route>(() => loadInitialRoute());
   /** 合并后的「设置」页里要滚到的分组（原来跳「关于」的地方滚到版本与更新、日志）。 */
   const [settingsFocus, setSettingsFocus] = useState<string | null>(() => initialSettingsFocus());
   /** 设置模式里整体设置页当前显示的卡片（一个分类一页）；深链到某张卡片时换到它所在的分类。 */
@@ -1813,6 +1777,10 @@ export function App() {
   /** 从旧的「旧版代理设置」入口进来：「连接与供应商」页直接展开「高级」。 */
   const [relayAdvancedOpen, setRelayAdvancedOpen] = useState(false);
   const [relayCommonOpen, setRelayCommonOpen] = useState(false);
+  const setRoute = useCallback((next: Route) => {
+    setRelayCommonOpen(false);
+    setRouteState(next);
+  }, []);
   /** 进设置模式前停的页面：侧栏「返回」回到这里。 */
   const lastMainRoute = useRef<Route>("hub");
   const [notice, setNotice] = useState<{ title: string; message: string; status?: Status } | null>(null);
@@ -1834,6 +1802,7 @@ export function App() {
   const [overview, setOverview] = useState<OverviewResult | null>(null);
   const [settings, setSettings] = useState<SettingsResult | null>(null);
   const [legacyDisconnectOpen, setLegacyDisconnectOpen] = useState(false);
+  const [addDirectProviderRequested, setAddDirectProviderRequested] = useState(false);
   // 外部改设置时要拿「上次读到的设置」与当前编辑比对，监听回调里读这个 ref 拿最新值。
   const settingsRef = useRef<SettingsResult | null>(null);
   settingsRef.current = settings;
@@ -1841,7 +1810,6 @@ export function App() {
   const [weixinQr, setWeixinQr] = useState<WeixinQrResult | null>(null);
   const [relay, setRelay] = useState<RelayResult | null>(null);
   const [relayFiles, setRelayFiles] = useState<RelayFilesResult | null>(null);
-  const relayFilesRead = useRef(0);
   const [envConflicts, setEnvConflicts] = useState<EnvConflictsResult | null>(null);
   const [relayEnvironment, setRelayEnvironment] = useState<RelayEnvironmentResult | null>(null);
   const [ccsProviders, setCcsProviders] = useState<CcsProvidersResult | null>(null);
@@ -1851,23 +1819,11 @@ export function App() {
   const [logs, setLogs] = useState<LogsResult | null>(null);
   const [diagnostics, setDiagnostics] = useState<DiagnosticsResult | null>(null);
   const [watcher, setWatcher] = useState<WatcherResult | null>(null);
-  const [dreamSkinStatus, setDreamSkinStatus] = useState<DreamSkinRuntimeResult | null>(null);
-  const [dreamSkinVerification, setDreamSkinVerification] = useState<DreamSkinVerificationResult | null>(null);
-  const [dreamSkinLibrary, setDreamSkinLibrary] = useState<DreamSkinThemeLibrary | null>(null);
-  const [dreamSkinMarket, setDreamSkinMarket] = useState<DreamSkinMarketResult | null>(null);
-  const [dreamSkinCommunity, setDreamSkinCommunity] = useState<DreamSkinCommunityResult | null>(null);
-  const [dreamSkinLibraryLoading, setDreamSkinLibraryLoading] = useState(false);
-  const [dreamSkinMarketLoading, setDreamSkinMarketLoading] = useState(false);
-  const [dreamSkinCommunityLoading, setDreamSkinCommunityLoading] = useState(false);
-  const [dreamSkinInstallOperation, setDreamSkinInstallOperation] = useState<DreamSkinInstallOperation | null>(null);
-  const dreamSkinInstallLockRef = useRef(false);
+  // 皮肤界面已移到 Codex 里；管理器只留网页一键换肤确认和「恢复默认皮肤」急救入口。
   const [pendingDreamSkinCommunity, setPendingDreamSkinCommunity] = useState("");
-  const [selectedDreamSkinTheme, setSelectedDreamSkinTheme] = useState("builtin");
-  const [savedDreamSkinThemeDraft, setSavedDreamSkinThemeDraft] = useState<DreamSkinThemeDraft | null>(null);
-  const [dreamSkinThemeDraft, setDreamSkinThemeDraft] = useState<DreamSkinThemeDraft | null>(null);
-  const [pendingDreamSkinRestart, setPendingDreamSkinRestart] = useState<PendingDreamSkinRestart | null>(null);
-  const [dreamSkinUnsavedDialog, setDreamSkinUnsavedDialog] = useState(false);
-  const dreamSkinPendingActionRef = useRef<(() => void) | null>(null);
+  const [dreamSkinCommunityInstalling, setDreamSkinCommunityInstalling] = useState(false);
+  const dreamSkinCommunityInstallingRef = useRef(false);
+  const [dreamSkinRestartPending, setDreamSkinRestartPending] = useState(false);
   const [update, setUpdate] = useState<UpdateResult | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
   /** 正在看的拓展页面（route === "extension" 时）。 */
@@ -1929,6 +1885,7 @@ export function App() {
   }, []);
   // 「会话」页默认看所有 Agent；切到 Codex 页签才是带删除 / 归档 / 修复的完整会话管理。
   const [sessionTab, setSessionTab] = useState<SessionTab>("all");
+  const [recoveryRefreshRequest, setRecoveryRefreshRequest] = useState(0);
   /** 请求日志打开时的 Agent 过滤（从 Agent 概览跳过去时设置，用一次就清掉）。 */
   const [requestLogAgentFilter, setRequestLogAgentFilter] = useState<"all" | "codex" | "claude" | "grok">("all");
   const [requestLogFocus, setRequestLogFocus] = useState<RequestLogFocus>({});
@@ -2009,48 +1966,10 @@ export function App() {
   const [selectedProviderSyncTarget, setSelectedProviderSyncTarget] = useState("");
   const [autoTakeover, setAutoTakeoverState] = useState<AutoTakeoverResult | null>(null);
   const [relaySwitching, setRelaySwitching] = useState(false);
-  const dreamSkinDraftDirty = Boolean(
-    savedDreamSkinThemeDraft
-      && dreamSkinThemeDraft
-      && isDreamSkinDraftDirty(savedDreamSkinThemeDraft, dreamSkinThemeDraft),
-  );
   const settingsDirty = useMemo(
     () => Boolean(settings && !backendSettingsEqual(settingsForm, settings.settings)),
     [settings, settingsForm],
   );
-
-  // 只有能确认通用模板和供应商快照归属的草稿才能推进版本。冲突时保留草稿，保存重试则停止。
-  const rebaseConfigDraft = (draft: BackendSettings, base: BackendSettings, fresh: BackendSettings,
-    { keepOtherFields = false } = {}): BackendSettings | null => {
-    if (draft.revision !== base.revision) return null;
-    const localCommon = draft.relayCommonConfigContents;
-    const diskCommon = fresh.relayCommonConfigContents;
-    if (localCommon !== base.relayCommonConfigContents && diskCommon !== base.relayCommonConfigContents
-      && localCommon !== diskCommon) return null;
-    const merged = keepOtherFields ? draft : rebaseSettingsEdits(draft, base, fresh);
-    const next = {
-      ...merged,
-      revision: fresh.revision,
-      relayCommonConfigContents: localCommon === base.relayCommonConfigContents ? diskCommon : localCommon,
-    };
-    if (merged.relayProfiles === fresh.relayProfiles) return next;
-    const before = new Map(base.relayProfiles.map(profile => [profile.id, profile.configContents]));
-    const after = new Map(fresh.relayProfiles.map(profile => [profile.id, profile.configContents]));
-    const profiles: RelayProfile[] = [];
-    for (const profile of merged.relayProfiles) {
-      const original = before.get(profile.id);
-      const saved = after.get(profile.id);
-      if (diskCommon !== base.relayCommonConfigContents && profile.id === base.activeRelayId
-        && original !== undefined && profile.configContents !== original && profile.configContents !== saved) return null;
-      if (original !== undefined && saved !== undefined && saved !== original && profile.configContents !== saved) {
-        if (profile.configContents !== original) return null;
-        profiles.push({ ...profile, configContents: saved });
-      } else {
-        profiles.push(profile);
-      }
-    }
-    return { ...next, relayProfiles: profiles };
-  };
 
   /// 保存撞上 settings_revision_conflict（后台 token 刷新等抢先写盘）时自动恢复：
   /// 拉最新设置，把本次提交的编辑 rebase 上去、合并外部轮换的登录 token 后重试一次；
@@ -2058,8 +1977,8 @@ export function App() {
   const retrySaveSettingsAfterConflict = async <T,>(
     args: Record<string, unknown> | undefined,
     snapshot: BackendSettings | undefined,
-    previous: BackendSettings | undefined,
   ): Promise<T | null> => {
+    const previous = settingsRef.current?.settings;
     if (!snapshot || !previous) return null;
     let latest: SettingsResult;
     try {
@@ -2070,12 +1989,15 @@ export function App() {
     if (!latest || !isSuccessStatus(latest.status)) return null;
     const base = normalizeSettings(previous);
     const fresh = normalizeSettings(latest.settings);
-    const merged = rebaseConfigDraft(normalizeSettings(snapshot), base, fresh);
-    if (!merged) return null;
+    const merged = mergeRotatedAuthContents(
+      rebaseSettingsEdits(normalizeSettings(snapshot), base, fresh),
+      base,
+      fresh,
+    );
     try {
       const retried = await invoke<T>("save_settings", {
         ...args,
-        settings: mergeRotatedAuthContents(merged, base, fresh),
+        settings: merged,
         expectedRevision: merged.revision || "",
       });
       const response = retried as { message?: string };
@@ -2088,13 +2010,12 @@ export function App() {
 
   const call = <T,>(command: string, args?: Record<string, unknown>) => {
     const snapshot = args?.settings as BackendSettings | undefined;
-    const previous = command === "save_settings" ? settingsRef.current?.settings : undefined;
     return invoke<T>(command, command === "save_settings"
       ? { ...args, expectedRevision: snapshot?.revision || "" }
       : args).then(async (result) => {
         const response = result as { message?: string };
         if (command === "save_settings" && response?.message?.includes("settings_revision_conflict")) {
-          const recovered = await retrySaveSettingsAfterConflict<T>(args, snapshot, previous);
+          const recovered = await retrySaveSettingsAfterConflict<T>(args, snapshot);
           if (recovered !== null) return recovered;
           // 所有保存调用都保留当前草稿，不能把失败响应当成新表单回填。
           throw new Error(response.message);
@@ -2187,12 +2108,20 @@ export function App() {
   useEffect(() => {
     const sync = async () => {
       const result = await run(() => call<SettingsResult>("load_settings"));
-      if (!result || !isSuccessStatus(result.status)) return;
-      acceptExternalSettings(result, { syncOnly: [
-        "computerUseMode", "computerUseApproval", "computerUsePip",
-        "claudeAppVoiceInput", "claudeAppLocalization", "claudeAppExtensions", "claudeAppComputerUse", "claudeAppBashTimeout", "claudeDesktopLocal",
-        "managerAgentFocus", "nativeAuthSelection",
-      ] });
+      if (!result) return;
+      const fresh = normalizeSettings(result.settings) as BackendSettings & Record<string, unknown>;
+      setSettings(result);
+      setSettingsForm((current) => {
+        const merged: Record<string, unknown> = { ...current, revision: fresh.revision };
+        for (const key of [
+          "computerUseMode", "computerUseApproval", "computerUsePip",
+          "claudeAppVoiceInput", "claudeAppLocalization", "claudeAppExtensions", "claudeAppComputerUse", "claudeAppBashTimeout", "claudeDesktopLocal",
+          // 使用模式也要带上：表单留着旧值，下一次整份保存会把刚记下的模式写回去。
+          "managerAgentFocus",
+          "nativeAuthSelection",
+        ]) merged[key] = fresh[key];
+        return merged as BackendSettings;
+      });
     };
     const handler = () => void sync();
     window.addEventListener(BACKEND_SETTINGS_CHANGED_EVENT, handler);
@@ -2228,24 +2157,12 @@ export function App() {
     return result;
   };
 
-  const dreamSkinRequest = (screenshotPath?: string) => ({
+  const dreamSkinRequest = () => ({
     request: {
       debugPort: overview?.latest_launch?.debug_port ?? parsePort(launchForm.debugPort, 9229),
       helperPort: overview?.latest_launch?.helper_port ?? parsePort(launchForm.helperPort, 57321),
-      screenshotPath: screenshotPath || null,
     },
   });
-
-  const refreshDreamSkinStatus = async (silent = false) => {
-    const result = await run(() => call<DreamSkinRuntimeResult>("dream_skin_status", dreamSkinRequest()));
-    if (result) {
-      setDreamSkinStatus(result);
-      if (!silent || !isSuccessStatus(result.status)) {
-        showResultNotice(t("Dream Skin 状态"), result, { silentSuccess: true });
-      }
-    }
-    return result;
-  };
 
   const refreshScriptMarket = async (silent = false, preserveRuntime = false) => {
     const result = await run(() => call<ScriptMarketResult>("refresh_script_market"));
@@ -2290,13 +2207,18 @@ export function App() {
   const setUserScriptsEnabled = async (enabled: boolean, host: ExtensionHost = "codex") => {
     const result = await run(() => call<SettingsResult>("set_user_scripts_enabled", { enabled, ...(host === "claude" ? { host } : {}) }));
     if (!result) return;
+    setSettings(result);
     setScriptMarket((current) => syncMarketInstalledState(current, result.user_scripts));
     if (host === "claude" && isSuccessStatus(result.status)) {
-      acceptExternalSettings(result, { syncOnly: ["claudeAppExtensions"] });
+      setSettingsForm((current) => ({
+        ...current,
+        revision: result.settings.revision,
+        claudeAppExtensions: result.settings.claudeAppExtensions,
+      }));
       if (claudeLocalizationMemo.status) {
         claudeLocalizationMemo.status = { ...claudeLocalizationMemo.status, extensions: result.user_scripts?.claude_enabled === true };
       }
-    } else setSettings(result);
+    }
     showResultNotice(t("本地拓展"), result);
     if (isSuccessStatus(result.status) && host === "codex") await reloadUserScripts();
   };
@@ -2368,9 +2290,7 @@ export function App() {
   };
 
   const refreshRelayFiles = async (silent = false) => {
-    const read = ++relayFilesRead.current;
     const result = await run(() => call<RelayFilesResult>("read_relay_files"));
-    if (read !== relayFilesRead.current) return null;
     if (result) {
       setRelayFiles(result);
       if (!silent) showResultNotice(t("配置文件"), result, { silentSuccess: true });
@@ -2506,422 +2426,49 @@ export function App() {
       });
     });
 
-  const setDreamSkinDraftSelection = (
-    key: string,
-    draft: DreamSkinThemeDraft,
-  ) => {
-    setSelectedDreamSkinTheme(key);
-    setSavedDreamSkinThemeDraft(draft);
-    setDreamSkinThemeDraft(draft);
-  };
-
-  const refreshDreamSkinLibrary = async (silent = false) => {
-    setDreamSkinLibraryLoading(true);
-    try {
-      const result = await run(() => call<DreamSkinThemeLibraryResult>("list_dream_skin_themes"));
-      if (!result) return null;
-      const library: DreamSkinThemeLibrary = {
-        themes: result.themes,
-        activeDraft: result.activeDraft,
-      };
-      setDreamSkinLibrary(library);
-      const active = library.themes.find((item) => item.active) ?? library.themes[0];
-      if (active) {
-        const draft = active.builtin
-          ? { config: defaultDreamSkinTheme(), imagePath: "", builtin: true }
-          : library.activeDraft;
-        setDreamSkinDraftSelection(active.key, draft);
-      }
-      if (!silent && !isSuccessStatus(result.status)) {
-        showResultNotice(t("主题库"), result);
-      }
-      return library;
-    } finally {
-      setDreamSkinLibraryLoading(false);
-    }
-  };
-
-  const refreshDreamSkinMarket = async (silent = false) => {
-    setDreamSkinMarketLoading(true);
-    try {
-      const result = await run(() => call<DreamSkinMarketResult>("refresh_dream_skin_market"));
-      if (result) {
-        setDreamSkinMarket(result);
-        if (!silent || !isSuccessStatus(result.status)) {
-          showResultNotice(t("主题市场"), result, { silentSuccess: true });
-        }
-      }
-      return result;
-    } finally {
-      setDreamSkinMarketLoading(false);
-    }
-  };
-
-  const refreshDreamSkinCommunity = async (silent = false) => {
-    setDreamSkinCommunityLoading(true);
-    try {
-      const result = await run(() => call<DreamSkinCommunityResult>("refresh_dream_skin_community"));
-      if (result) {
-        setDreamSkinCommunity(result);
-        if (!silent || !isSuccessStatus(result.status)) {
-          showResultNotice(t("DreamSkin 社区"), result, { silentSuccess: true });
-        }
-      }
-      return result;
-    } finally {
-      setDreamSkinCommunityLoading(false);
-    }
-  };
-
-  const runDreamSkinInstallOperation = async <T,>(
-    operation: DreamSkinInstallOperation,
-    install: () => Promise<T>,
-  ): Promise<T | null> => runExclusiveDreamSkinInstall(
-    dreamSkinInstallLockRef,
-    (pending) => setDreamSkinInstallOperation(pending ? operation : null),
-    install,
-  );
-
-  const installDreamSkinCommunityTheme = async (theme: DreamSkinCommunityTheme) => {
-    const installed = await runDreamSkinInstallOperation(
-      { source: "community", id: theme.id, name: theme.name },
-      async () => {
-        const result = await run(() => call<DreamSkinCommunityResult>(
-          "install_dream_skin_community_theme",
-          { id: theme.id },
-        ));
-        if (!result) return false;
-        setDreamSkinCommunity(result);
-        showResultNotice(t("DreamSkin 社区"), result);
-        if (!isSuccessStatus(result.status)) return false;
-        await refreshDreamSkinLibrary(true);
-        const draft = await loadDreamSkinThemeDraft(theme.themeId);
-        if (draft) setDreamSkinDraftSelection(`stored:${theme.themeId}`, draft);
-        return true;
-      },
-    );
-    return installed ?? false;
-  };
-
   const refreshPendingDreamSkinCommunity = async () => {
     const result = await run(() => call<PendingDreamSkinCommunityResult>("load_pending_dream_skin_community"));
     if (result) setPendingDreamSkinCommunity(result.versionId);
     return result;
   };
 
+  /// 网页一键换肤（dreamskin:// 链接由系统交给管理器）：确认后下载安装，再按安装出的主题 id 应用。
+  /// 主题库和编辑界面已移到 Codex 里，这里只走安装 + 应用两条命令。
   const confirmPendingDreamSkinCommunity = async () => {
-    await runDreamSkinInstallOperation(
-      { source: "pending-community", id: pendingDreamSkinCommunity, name: t("网页一键换肤主题") },
-      async () => {
-        const result = await run(() => call<DreamSkinCommunityResult>("confirm_pending_dream_skin_community"));
-        if (!result) return false;
-        setDreamSkinCommunity(result);
-        showResultNotice(t("DreamSkin 社区"), result);
-        if (!isSuccessStatus(result.status)) return false;
-        setPendingDreamSkinCommunity("");
-        setRoute("dreamSkin");
-        await refreshDreamSkinLibrary(true);
-        if (result.installedThemeId) {
-          const draft = await loadDreamSkinThemeDraft(result.installedThemeId);
-          if (draft) {
-            setDreamSkinDraftSelection(`stored:${result.installedThemeId}`, draft);
-            await activateDreamSkinDraft(draft);
-          }
+    if (dreamSkinCommunityInstallingRef.current) return;
+    dreamSkinCommunityInstallingRef.current = true;
+    setDreamSkinCommunityInstalling(true);
+    try {
+      const result = await run(() => call<DreamSkinCommunityResult>("confirm_pending_dream_skin_community"));
+      if (!result) return;
+      showResultNotice(t("DreamSkin 社区"), result);
+      if (!isSuccessStatus(result.status)) return;
+      setPendingDreamSkinCommunity("");
+      setRoute("dreamSkin");
+      const themeId = result.installedThemeId?.trim();
+      if (themeId) {
+        const activation = await run(() => call<DreamSkinInstalledThemeActivationResult>(
+          "activate_installed_dream_skin_theme",
+          { id: themeId },
+        ));
+        if (activation) {
+          showResultNotice(t("主题库"), activation);
+          if (isSuccessStatus(activation.status) && activation.savedForNextLaunch) setDreamSkinRestartPending(true);
         }
-        return true;
       }
-    );
+      await refreshSettings(true);
+    } finally {
+      dreamSkinCommunityInstallingRef.current = false;
+      setDreamSkinCommunityInstalling(false);
+    }
   };
 
   const dismissPendingDreamSkinCommunity = async () => {
-    if (dreamSkinInstallLockRef.current && dreamSkinInstallOperation?.source === "pending-community") return;
+    if (dreamSkinCommunityInstallingRef.current) return;
     const result = await run(() => call<PendingDreamSkinCommunityResult>("dismiss_pending_dream_skin_community"));
     if (!result) return;
     if (isSuccessStatus(result.status)) setPendingDreamSkinCommunity("");
     else showResultNotice(t("DreamSkin 社区"), result);
-  };
-
-  const importDreamSkinThemePackage = async () => {
-    let selected: string | string[] | null;
-    try {
-      selected = await open({
-        title: t("导入 DreamSkin 主题包"),
-        multiple: false,
-        directory: false,
-        filters: [{ name: "DreamSkin ZIP", extensions: ["zip"] }],
-      });
-    } catch (error) {
-      showNotice(t("主题库"), tf("打开选择器失败：{0}", [stringifyError(error)]), "failed");
-      return;
-    }
-    const path = Array.isArray(selected) ? selected[0] : selected;
-    if (!path) return;
-    await runDreamSkinInstallOperation(
-      { source: "import", id: "local-package", name: t("本地主题包") },
-      async () => {
-        const previousIds = new Set(dreamSkinLibrary?.themes.map((item) => item.id) ?? []);
-        const result = await run(() => call<DreamSkinThemeLibraryResult>(
-          "import_dream_skin_theme_package",
-          { path },
-        ));
-        if (!result) return false;
-        showResultNotice(t("主题库"), result);
-        if (!isSuccessStatus(result.status)) return false;
-        const library = { themes: result.themes, activeDraft: result.activeDraft };
-        setDreamSkinLibrary(library);
-        const imported = result.themes.find((item) => item.kind === "stored" && !previousIds.has(item.id));
-        if (imported) {
-          const draft = await loadDreamSkinThemeDraft(imported.id);
-          if (draft) setDreamSkinDraftSelection(imported.key, draft);
-        }
-        await refreshDreamSkinCommunity(true);
-        return true;
-      },
-    );
-  };
-
-  const installDreamSkinMarketTheme = async (theme: DreamSkinMarketTheme) => {
-    const installed = await runDreamSkinInstallOperation(
-      { source: "market", id: theme.id, name: theme.name },
-      async () => {
-        const result = await run(() => call<DreamSkinMarketResult>("install_dream_skin_market_theme", { id: theme.id }));
-        if (!result) return false;
-        setDreamSkinMarket(result);
-        showResultNotice(t("主题市场"), result);
-        if (!isSuccessStatus(result.status)) return false;
-        await refreshDreamSkinLibrary(true);
-        const draft = await loadDreamSkinThemeDraft(theme.id);
-        if (draft) setDreamSkinDraftSelection(`stored:${theme.id}`, draft);
-        return true;
-      },
-    );
-    return installed ?? false;
-  };
-
-  const runAfterDreamSkinDraftGuard = (action: () => void) => {
-    if (!dreamSkinDraftDirty) {
-      action();
-      return;
-    }
-    dreamSkinPendingActionRef.current = action;
-    setDreamSkinUnsavedDialog(true);
-  };
-
-  const loadDreamSkinThemeDraft = async (id: string) => {
-    const result = await run(() => call<DreamSkinThemeDraftResult>("load_dream_skin_theme", { id }));
-    if (!result || !isSuccessStatus(result.status)) {
-      if (result) showResultNotice(t("主题库"), result);
-      return null;
-    }
-    return {
-      config: result.config,
-      imagePath: result.imagePath,
-      builtin: result.builtin,
-    } satisfies DreamSkinThemeDraft;
-  };
-
-  const selectDreamSkinTheme = (item: DreamSkinThemeSummary) => {
-    if (item.key === selectedDreamSkinTheme) return;
-    runAfterDreamSkinDraftGuard(() => {
-      void (async () => {
-        if (item.builtin) {
-          setDreamSkinDraftSelection(item.key, {
-            config: defaultDreamSkinTheme(),
-            imagePath: "",
-            builtin: true,
-          });
-          return;
-        }
-        if (item.active && dreamSkinLibrary) {
-          setDreamSkinDraftSelection(item.key, dreamSkinLibrary.activeDraft);
-          return;
-        }
-        const draft = await loadDreamSkinThemeDraft(item.id);
-        if (draft) setDreamSkinDraftSelection(item.key, draft);
-      })();
-    });
-  };
-
-  const saveDreamSkinThemeDraft = async (): Promise<DreamSkinThemeDraft | null> => {
-    if (!dreamSkinThemeDraft) return null;
-    const selected = dreamSkinLibrary?.themes.find((item) => item.key === selectedDreamSkinTheme);
-    const saveAsNew = dreamSkinThemeDraft.builtin || selected?.kind === "activeUnsaved";
-    const draft: DreamSkinThemeDraft = saveAsNew
-      ? {
-          ...dreamSkinThemeDraft,
-          config: {
-            ...dreamSkinThemeDraft.config,
-            id: dreamSkinThemeDraft.builtin
-              ? `theme-${Date.now()}`
-              : dreamSkinThemeDraft.config.id,
-            name: dreamSkinThemeDraft.config.name === "Dream Skin"
-              ? t("Dream Skin 副本")
-              : dreamSkinThemeDraft.config.name,
-          },
-          builtin: false,
-        }
-      : dreamSkinThemeDraft;
-    const result = await run(() => call<DreamSkinThemeLibraryResult>("save_dream_skin_theme", { draft }));
-    if (!result || !isSuccessStatus(result.status)) {
-      if (result) showResultNotice(t("主题库"), result);
-      return null;
-    }
-    const stored = await loadDreamSkinThemeDraft(draft.config.id);
-    if (!stored) return null;
-    setDreamSkinLibrary({ themes: result.themes, activeDraft: result.activeDraft });
-    setDreamSkinDraftSelection(`stored:${draft.config.id}`, stored);
-    return stored;
-  };
-
-  const createDreamSkinTheme = async () => {
-    let selected: unknown;
-    try {
-      selected = await open({
-        directory: false,
-        multiple: false,
-        title: t("选择皮肤图片"),
-        filters: [{
-          name: t("图片"),
-          extensions: isWindowsPlatform
-            ? ["png", "jpg", "jpeg", "webp", "gif", "bmp"]
-            : ["png", "jpg", "jpeg", "heic", "tif", "tiff", "webp"],
-        }],
-      });
-    } catch (error) {
-      showNotice(t("主题库"), tf("打开选择器失败：{0}", [stringifyError(error)]), "failed");
-      return;
-    }
-    if (typeof selected !== "string" || !selected.trim()) return;
-    const result = await run(() => call<DreamSkinThemeDraftResult>("create_dream_skin_theme", { path: selected.trim() }));
-    if (!result || !isSuccessStatus(result.status)) {
-      if (result) showResultNotice(t("主题库"), result);
-      return;
-    }
-    const draft: DreamSkinThemeDraft = {
-      config: result.config,
-      imagePath: result.imagePath,
-      builtin: result.builtin,
-    };
-    await refreshDreamSkinLibrary(true);
-    setDreamSkinDraftSelection(`stored:${draft.config.id}`, draft);
-  };
-
-  const chooseDreamSkinDraftImage = async () => {
-    let selected: unknown;
-    try {
-      selected = await open({
-        directory: false,
-        multiple: false,
-        title: t("选择皮肤图片"),
-        filters: [{
-          name: t("图片"),
-          extensions: isWindowsPlatform
-            ? ["png", "jpg", "jpeg", "webp", "gif", "bmp"]
-            : ["png", "jpg", "jpeg", "heic", "tif", "tiff", "webp"],
-        }],
-      });
-    } catch (error) {
-      showNotice(t("主题库"), tf("打开选择器失败：{0}", [stringifyError(error)]), "failed");
-      return;
-    }
-    if (typeof selected === "string" && selected.trim()) {
-      setDreamSkinThemeDraft((current) => current ? { ...current, imagePath: selected.trim() } : current);
-    }
-  };
-
-  const activateDreamSkinDraft = async (initialDraft: DreamSkinThemeDraft) => {
-    const currentTheme = pendingDreamSkinRestart
-      ? {
-          key: pendingDreamSkinRestart.currentThemeKey,
-          name: pendingDreamSkinRestart.currentThemeName,
-        }
-      : dreamSkinLibrary?.themes.find((item) => item.active) ?? null;
-    let draft = initialDraft;
-    if (draft.builtin && dreamSkinDraftDirty) {
-      const stored = await saveDreamSkinThemeDraft();
-      if (!stored) return false;
-      draft = stored;
-    }
-    const saved = await persistDreamSkinSettings({
-      ...settingsForm,
-      codexAppDreamSkinEnabled: true,
-      codexAppDreamSkinPaused: false,
-    });
-    if (!saved) return false;
-    const ports = dreamSkinRequest().request;
-    const result = await run(() => call<DreamSkinThemeActivationResult>("activate_dream_skin_theme", {
-      request: {
-        draft,
-        debugPort: ports.debugPort,
-        helperPort: ports.helperPort,
-      },
-    }));
-    if (!result || !isSuccessStatus(result.status)) {
-      if (result) showResultNotice(t("主题库"), result);
-      return false;
-    }
-    setDreamSkinLibrary(result.library);
-    setDreamSkinStatus({ ...result.runtime, status: result.status, message: result.message });
-    const active = result.library.themes.find((item) => item.active);
-    if (active) setDreamSkinDraftSelection(active.key, result.library.activeDraft);
-    await refreshSettings(true);
-    if (result.savedForNextLaunch) {
-      setPendingDreamSkinRestart({
-        currentThemeKey: currentTheme?.key ?? null,
-        currentThemeName: currentTheme?.name ?? t("当前皮肤"),
-        pendingThemeKey: active?.key ?? selectedDreamSkinTheme,
-        pendingThemeName: active?.name ?? draft.config.name,
-      });
-      showNotice(t("主题库"), t("主题已保存并设为待应用，不会自动重启 Codex。"), "not_checked");
-    } else {
-      setPendingDreamSkinRestart(null);
-    }
-    return true;
-  };
-
-  const activateDreamSkinTheme = async () => {
-    if (!dreamSkinThemeDraft) return;
-    await activateDreamSkinDraft(dreamSkinThemeDraft);
-  };
-
-  const renameDreamSkinTheme = async (item: DreamSkinThemeSummary) => {
-    const name = (await appPrompt(t("重命名主题"), { defaultValue: item.name, placeholder: t("输入新的主题名称") }))?.trim();
-    if (!name || name === item.name) return;
-    const result = await run(() => call<DreamSkinThemeLibraryResult>("rename_dream_skin_theme", { id: item.id, name }));
-    if (!result || !isSuccessStatus(result.status)) {
-      if (result) showResultNotice(t("主题库"), result);
-      return;
-    }
-    setDreamSkinLibrary({ themes: result.themes, activeDraft: result.activeDraft });
-    if (selectedDreamSkinTheme === item.key) {
-      setDreamSkinThemeDraft((current) => current
-        ? { ...current, config: { ...current.config, name } }
-        : current);
-      setSavedDreamSkinThemeDraft((current) => current
-        ? { ...current, config: { ...current.config, name } }
-        : current);
-    }
-  };
-
-  const deleteDreamSkinTheme = async (item: DreamSkinThemeSummary) => {
-    const confirmed = await confirmSessionDelete(
-      t("删除主题"),
-      tf("删除主题“{0}”？此操作无法撤销。", [item.name]),
-    );
-    if (!confirmed) return;
-    const result = await run(() => call<DreamSkinThemeLibraryResult>("delete_dream_skin_theme", { id: item.id }));
-    if (!result || !isSuccessStatus(result.status)) {
-      if (result) showResultNotice(t("主题库"), result);
-      return;
-    }
-    setDreamSkinLibrary({ themes: result.themes, activeDraft: result.activeDraft });
-    const active = result.themes.find((candidate) => candidate.active) ?? result.themes[0];
-    if (active) {
-      const draft = active.builtin
-        ? { config: defaultDreamSkinTheme(), imagePath: "", builtin: true }
-        : result.activeDraft;
-      setDreamSkinDraftSelection(active.key, draft);
-    }
   };
 
   const selectSessionIndexCleanupCandidates = (candidates: SessionIndexCleanupCandidate[]) =>
@@ -3054,9 +2601,11 @@ export function App() {
   /**
    * 读取自动接管状态。总开关关闭时不探测：守护线程本来就不工作，
    * 读到的只会是「未运行」，徒增一次 IPC。
+   * `enabled` 由刚保存开关的调用方传入：那时闭包里的 settings 还是旧值（关），
+   * 照旧值判断会把刚打开的状态清空，状态行一直显示「未运行」。
    */
-  const refreshAutoTakeover = async (silent = false) => {
-    if (settings && !settings.settings.codexAppAutoTakeover) {
+  const refreshAutoTakeover = async (silent = false, enabled = settings?.settings.codexAppAutoTakeover) => {
+    if (enabled === false) {
       setAutoTakeoverState(null);
       return;
     }
@@ -3074,7 +2623,7 @@ export function App() {
     if (!saved) return;
     setSettings((current) => (current ? { ...current, settings: saved } : current));
     if (enabled) {
-      await refreshAutoTakeover(true);
+      await refreshAutoTakeover(true, true);
     } else {
       setAutoTakeoverState(null);
     }
@@ -3088,17 +2637,31 @@ export function App() {
     }
   };
 
-  const navigate = async (target: Route, skipDreamSkinDraftGuard = false) => {
+  // 首页和设置页都显示接管状态：开着时轮询，接管、跳过、出错都能马上看到（原先只在进页面时读一次）。
+  // 首页的「Codex++ 没开机自启」提示要用到 watcher，进首页时顺带读一次。
+  const autoTakeoverOn = Boolean(settings?.settings.codexAppAutoTakeover);
+  const autoTakeoverVisible = route === "home" || route === "agentSettings";
+  useEffect(() => {
+    if (!autoTakeoverVisible || !autoTakeoverOn) return;
+    let cancelled = false;
+    const load = () => void invoke<AutoTakeoverResult>("load_auto_takeover_state")
+      .then((result) => { if (!cancelled) setAutoTakeoverState(result); })
+      .catch(() => {});
+    load();
+    if (route === "home") void invoke<WatcherResult>("load_watcher_state").then((result) => { if (!cancelled) setWatcher(result); }).catch(() => {});
+    const timer = window.setInterval(load, 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [autoTakeoverVisible, autoTakeoverOn, route]);
+
+  const navigate = async (target: Route) => {
     // 安装维护并进了 Codex 设置页；关于并进了设置页（滚到版本与更新）。
     if (target === "about") setSettingsFocus("app-settings-update");
     // 旧版代理设置并进了「连接与供应商」页底部的「高级」：旧入口打开那一页并展开「高级」。
     setRelayAdvancedOpen(target === "relayEnvironment");
     const next: Route = target === "maintenance" ? "agentSettings" : target === "about" ? "settings" : target === "relayEnvironment" ? "relay" : target === "recommendations" ? "home" : target;
-    if (!skipDreamSkinDraftGuard && route === "dreamSkin" && next !== "dreamSkin" && dreamSkinDraftDirty) {
-      runAfterDreamSkinDraftGuard(() => void navigate(next, true));
-      return;
-    }
-    setRelayCommonOpen(false);
     setRoute(next);
     if (next === "overview") await refreshOverview(true);
     if (next === "relay" || next === "multiLaunch") {
@@ -3132,10 +2695,6 @@ export function App() {
     if (next === "dreamSkin") {
       await refreshSettings(true);
       await refreshOverview(true);
-      await refreshDreamSkinStatus(true);
-      await refreshDreamSkinLibrary(true);
-      await refreshDreamSkinMarket(true);
-      await refreshDreamSkinCommunity(true);
     }
     if (next === "settings" || next === "agentSettings" || next === "enhance") await refreshSettings(true);
     if (next === "userScripts") {
@@ -3170,8 +2729,12 @@ export function App() {
       if (!navigation) return false;
       const destination = managerNavigationDestination(navigation);
       await refreshSettings(true);
-      if (destination.route === "enhance" || destination.route === "pluginMarket" || destination.route === "weixin") {
+      if (destination.route === "enhance" || destination.route === "pluginMarket" || destination.route === "weixin" || destination.route === "sessions") {
         setActiveTool("codex");
+      }
+      if (destination.route === "sessions") {
+        setSessionTab("codex");
+        setRecoveryRefreshRequest(current => current + 1);
       }
       setRoute(destination.route);
       if (destination.route === "weixin") await refreshWeixinStatus(true);
@@ -3342,7 +2905,7 @@ export function App() {
         completion
         && resolveLaunchStatus(completion.latest_launch, result.launchStartedAtMs ?? 0) === "success",
       );
-      if (succeeded) setPendingDreamSkinRestart(null);
+      if (succeeded) setDreamSkinRestartPending(false);
       return succeeded;
     } finally {
       launchPendingRef.current = false;
@@ -3504,7 +3067,9 @@ export function App() {
         showNotice(t("跳过此版本"), result.message, "failed");
         return;
       }
-      acceptExternalSettings(result, { syncOnly: ["updateSkippedVersion"] });
+      const fresh = normalizeSettings(result.settings);
+      setSettings(result);
+      setSettingsForm((current) => ({ ...current, updateSkippedVersion: fresh.updateSkippedVersion, revision: fresh.revision }));
     } catch (error) {
       showNotice(t("跳过此版本"), stringifyError(error), "failed");
     }
@@ -3662,6 +3227,34 @@ export function App() {
     return null;
   };
 
+  const saveCommonTemplate = async (original: string, contents: string) => {
+    const current = await run(() => invoke<BackendSettings>("read_relay_common_config", { draft: contents }));
+    if (!current) return null;
+    if ((current.relayCommonConfigContents ?? "") !== original) {
+      showNotice(t("通用配置文件"), t("供应商配置已变更。请保留需要的草稿，再返回列表重新打开。"), "failed");
+      return null;
+    }
+    // 模板草稿不能用全局保存的自动重试覆盖刚被外部修改的模板。
+    const result = await run(() => invoke<SettingsResult>("save_settings", {
+      settings: { ...current, relayCommonConfigContents: contents },
+      expectedRevision: current.revision,
+    }));
+    if (!result || !isSuccessStatus(result.status)) {
+      if (result) showNotice(t("设置保存"), result.message, result.status);
+      return null;
+    }
+    const saved = normalizeSettings(result.settings);
+    const previous = normalizeSettings(settingsRef.current?.settings ?? current);
+    setSettings(result);
+    setSettingsForm(form => {
+      if (form.revision !== previous.revision) return form;
+      const merged = mergeRotatedAuthContents(rebaseSettingsEdits(form, previous, saved), previous, saved);
+      return { ...merged, relayCommonConfigContents: saved.relayCommonConfigContents };
+    });
+    showNotice(t("通用配置文件"), t("已保存。请重新应用使用通用配置的供应商。"), "ok");
+    return result;
+  };
+
   const closeAgentFocus = (mode: FocusMode) => commitAgentFocusSelection(mode, {
     disableRelaySwitching: async () => {
       // 用最新版本关闭旧配置切换，失败时保留原模式和问卷，不提前隐藏管理入口。
@@ -3677,9 +3270,13 @@ export function App() {
         return false;
       }
       const saved = normalizeSettings(result.settings);
-      acceptExternalSettings(result);
+      const previous = normalizeSettings(settingsRef.current?.settings ?? latest.settings);
+      setSettings(result);
       // 模式选择只修改这一个开关；其他页面尚未保存的编辑继续保留。
-      setSettingsForm((current) => ({ ...current, relayProfilesEnabled: false }));
+      setSettingsForm((current) => ({
+        ...rebaseSettingsEdits(normalizeSettings(current), previous, saved),
+        relayProfilesEnabled: false,
+      }));
       return !saved.relayProfilesEnabled;
     },
     commit: (next) => {
@@ -3701,8 +3298,7 @@ export function App() {
       if (!isSuccessStatus(result.status)) return { status: "failed", message: result.message };
       const saved = normalizeSettings(result.settings);
       setSettings(result);
-      setSettingsForm((current) => rebaseConfigDraft(current, normalized, saved,
-        { keepOtherFields: !backendSettingsEqual(current, snapshot) }) ?? current);
+      setSettingsForm((current) => (backendSettingsEqual(current, snapshot) ? saved : { ...current, revision: saved.revision }));
       return { status: "saved" };
     } catch (error) {
       return { status: "failed", message: stringifyError(error) };
@@ -3851,6 +3447,7 @@ export function App() {
     const result = await run(() => call<AdsResult>("load_ads"));
     if (result) {
       setAds(result);
+      setSponsorAds(result);
       if (!silent) showResultNotice(t("推荐内容"), result, { silentSuccess: true });
     }
   };
@@ -4193,10 +3790,10 @@ export function App() {
     return isSuccessStatus(result.status) ? normalized : null;
   };
 
-  const extractRelayCommonConfig = async (configContents: string, contextConfigContents: string) => {
+  const extractRelayCommonConfig = async (configContents: string) => {
     const result = await run(() =>
       call<ExtractRelayCommonConfigResult>("extract_relay_common_config", {
-        request: { configContents, contextConfigContents },
+        request: { configContents },
       }),
     );
     if (result) showResultNotice(t("通用配置文件"), result);
@@ -4498,6 +4095,11 @@ export function App() {
   trayRequestHandlerRef.current = async (request: TrayRequest): Promise<TrayResult> => {
     const revealMainWindow = () => void invoke("tray_panel_action", { action: "open" }).catch(() => {});
     if (request.kind === "navigate") {
+      if (request.route === "addDirectProvider") {
+        setAddDirectProviderRequested(true);
+        await switchTool("codex", "relay");
+        return { id: request.id, ok: true };
+      }
       if (request.route === "sessions" || request.route === "requestLog") setActiveTool("codex");
       await navigate(request.route);
       return { id: request.id, ok: true };
@@ -4546,7 +4148,7 @@ export function App() {
       setProviderSyncProgress((current) => current.active ? current : ({ active: false, percent: 0, message: result.message, result }));
     }).catch(() => {});
     return () => { disposed = true; };
-  }, [route]);
+  }, [route, recoveryRefreshRequest]);
 
   useEffect(() => {
     if (route !== "sessions") return;
@@ -4646,49 +4248,6 @@ export function App() {
     return () => window.removeEventListener("focus", refresh);
   }, []);
 
-  const acceptExternalSettings = (result: SettingsResult, { syncOnly }: {
-    syncOnly?: readonly Exclude<keyof BackendSettings, "revision" | "relayProfiles" | "relayCommonConfigContents">[];
-  } = {}) => {
-    const previous = settingsRef.current?.settings;
-    const latest = normalizeSettings(result.settings);
-    const base = previous && normalizeSettings(previous);
-    if (base && (latest.relayCommonConfigContents !== base.relayCommonConfigContents
-      || (latest.activeRelayId === base.activeRelayId && latest.activeRelayId
-        && latest.relayProfiles.find(profile => profile.id === latest.activeRelayId)?.configContents
-          !== base.relayProfiles.find(profile => profile.id === base.activeRelayId)?.configContents))) {
-      ++relayFilesRead.current;
-      setRelayFiles(null);
-    }
-    setSettings(result);
-    setSettingsForm((current) => {
-      if (!base) return current.revision ? current : latest;
-      const next = rebaseConfigDraft(normalizeSettings(current), base, latest,
-        { keepOtherFields: !!syncOnly }) ?? current;
-      return syncOnly ? { ...next, ...Object.fromEntries(syncOnly.map(key => [key, latest[key]])) } : next;
-    });
-  };
-
-  const saveCommonTemplate = async (original: string, text: string) => {
-    const current = settingsRef.current;
-    if (!current || !isSuccessStatus(current.status)) {
-      showNotice(t("设置读取失败"), current?.message ?? t("正在读取…"), "failed");
-      return null;
-    }
-    if ((current.settings.relayCommonConfigContents || "") !== original) {
-      showNotice(t("通用配置文件"), t("供应商配置已变更。请保留需要的草稿，再返回列表重新打开。"), "failed");
-      return null;
-    }
-    const result = await run(() => call<SettingsResult>("save_settings", {
-      settings: { ...current.settings, relayCommonConfigContents: text },
-    }));
-    if (!result || !isSuccessStatus(result.status)) {
-      if (result) showNotice(t("设置保存"), result.message, result.status);
-      return null;
-    }
-    acceptExternalSettings(result);
-    return normalizeSettings(result.settings);
-  };
-
   // 网关改了 Codex 的直连设置（接入 / 断开网关），或在 Codex 设置页改了开关：
   // 重新读取并把尚未保存的编辑叠上去，免得用旧设置整份写回或撞上 revision 冲突。
   useEffect(() => {
@@ -4702,7 +4261,12 @@ export function App() {
         return;
       }
       if (disposed || !isSuccessStatus(result.status)) return;
-      acceptExternalSettings(result);
+      const previous = settingsRef.current?.settings;
+      const latest = normalizeSettings(result.settings);
+      setSettings(result);
+      setSettingsForm((current) => (previous
+        ? rebaseSettingsEdits(normalizeSettings(current), normalizeSettings(previous), latest)
+        : latest));
     };
     void listen("codex-plus-settings-changed", () => {
       if (!disposed) void syncExternalSettings();
@@ -4748,64 +4312,13 @@ export function App() {
     return result;
   };
 
-  const persistDreamSkinSettings = async (next: BackendSettings) => {
-    const normalized = normalizeSettings(next);
-    const result = await run(() => call<SettingsResult>("save_settings", { settings: normalized }));
-    if (!result) return null;
-    setSettings(result);
-    setSettingsForm(normalizeSettings(result.settings));
-    if (!isSuccessStatus(result.status)) {
-      showNotice(t("皮肤管理"), result.message, result.status);
-      return null;
-    }
-    return result;
-  };
-
+  /// 皮肤急救入口：关掉皮肤并恢复 Codex 原始外观；命令只记为待应用，重启 Codex 后完整生效（提示文案来自命令结果）。
   const restoreDreamSkin = async () => {
-    const currentTheme = pendingDreamSkinRestart
-      ? {
-          key: pendingDreamSkinRestart.currentThemeKey,
-          name: pendingDreamSkinRestart.currentThemeName,
-        }
-      : dreamSkinLibrary?.themes.find((item) => item.active) ?? null;
     const result = await run(() => call<DreamSkinRuntimeResult>("restore_dream_skin", dreamSkinRequest()));
     if (!result) return;
-    setDreamSkinStatus(result);
     await refreshSettings(true);
     showResultNotice(t("皮肤管理"), result);
-    if (isSuccessStatus(result.status)) {
-      setPendingDreamSkinRestart({
-        currentThemeKey: currentTheme?.key ?? null,
-        currentThemeName: currentTheme?.name ?? t("当前皮肤"),
-        pendingThemeKey: "codex-original-appearance",
-        pendingThemeName: t("Codex 原始外观"),
-      });
-    }
-  };
-
-  const verifyDreamSkin = async (withScreenshot: boolean) => {
-    let screenshotPath: string | undefined;
-    if (withScreenshot) {
-      try {
-        const selected = await saveDialog({
-          title: t("保存 Dream Skin 截图"),
-          defaultPath: "codex-dream-skin-verification.png",
-          filters: [{ name: "PNG", extensions: ["png"] }],
-        });
-        if (!selected) return;
-        screenshotPath = selected;
-      } catch (error) {
-        showNotice(t("保存截图"), tf("打开选择器失败：{0}", [stringifyError(error)]), "failed");
-        return;
-      }
-    }
-    const result = await run(() =>
-      call<DreamSkinVerificationResult>("verify_dream_skin", dreamSkinRequest(screenshotPath)),
-    );
-    if (!result) return;
-    setDreamSkinVerification(result);
-    showResultNotice(withScreenshot ? t("保存截图") : t("实机验证"), result);
-    await refreshDreamSkinStatus(true);
+    if (isSuccessStatus(result.status)) setDreamSkinRestartPending(true);
   };
 
   const actions = useMemo(
@@ -4827,7 +4340,6 @@ export function App() {
       performUpdate,
       saveSettings,
       saveSettingsValue,
-      saveCommonTemplate,
       autoSaveSettings,
       previewSettingsForm: (next: BackendSettings) => setSettingsForm(normalizeSettings(next)),
       refreshSettings,
@@ -4874,51 +4386,7 @@ export function App() {
           await refreshOverview(true);
         }
       },
-      chooseDreamSkinImagePath: chooseDreamSkinDraftImage,
-      resetDreamSkinImage: async () => runAfterDreamSkinDraftGuard(() => {
-        setDreamSkinThemeDraft((current) => current ? { ...current, imagePath: "" } : current);
-      }),
-      resetDreamSkinTheme: async () => runAfterDreamSkinDraftGuard(() => {
-        setDreamSkinThemeDraft((current) => {
-          if (!current) return current;
-          if (isWindowsPlatform) {
-            const config = { ...current.config };
-            delete config.colors;
-            delete config.palette;
-            return { ...current, config };
-          }
-          const defaults = defaultDreamSkinTheme();
-          return {
-            ...current,
-            config: current.builtin
-              ? defaults
-              : { ...defaults, id: current.config.id, name: current.config.name },
-            imagePath: "",
-          };
-        });
-      }),
-      refreshDreamSkinLibrary,
-      refreshDreamSkinMarket,
-      refreshDreamSkinCommunity,
-      installDreamSkinMarketTheme,
-      installDreamSkinCommunityTheme,
-      importDreamSkinThemePackage,
-      createDreamSkinTheme: async () => runAfterDreamSkinDraftGuard(() => void createDreamSkinTheme()),
-      saveDreamSkinTheme: saveDreamSkinThemeDraft,
-      selectDreamSkinTheme,
-      renameDreamSkinTheme,
-      deleteDreamSkinTheme: async (item: DreamSkinThemeSummary) => {
-        if (item.key === selectedDreamSkinTheme && dreamSkinDraftDirty) {
-          runAfterDreamSkinDraftGuard(() => void deleteDreamSkinTheme(item));
-          return;
-        }
-        await deleteDreamSkinTheme(item);
-      },
-      activateDreamSkinTheme,
-      refreshDreamSkinStatus,
       restoreDreamSkin,
-      verifyDreamSkin: () => verifyDreamSkin(false),
-      saveDreamSkinScreenshot: () => verifyDreamSkin(true),
       saveManualCodexAppPath: async () => {
         const appPath = launchForm.appPath.trim();
         if (!appPath) {
@@ -5003,7 +4471,7 @@ export function App() {
       toggleTheme: () => setThemePreference(toggledThemePreference(theme)),
       setThemePreference,
     }),
-    [route, launchForm, settingsForm, settings, overview, update, updateInstallProgress.active, logs, diagnostics, theme, relayFiles, localSessions, selectedProviderSyncTarget, envConflicts, relayEnvironment, ccsProviders, multiLaunchPending, multiLaunchInstances, multiLaunchInstancesLoading, multiLaunchActionPending, dreamSkinLibrary, dreamSkinMarket, dreamSkinCommunity, selectedDreamSkinTheme, savedDreamSkinThemeDraft, dreamSkinThemeDraft, dreamSkinDraftDirty, pendingDreamSkinRestart, getLanguage()],
+    [route, launchForm, settingsForm, settings, overview, update, updateInstallProgress.active, logs, diagnostics, theme, relayFiles, localSessions, selectedProviderSyncTarget, envConflicts, relayEnvironment, ccsProviders, multiLaunchPending, multiLaunchInstances, multiLaunchInstancesLoading, multiLaunchActionPending, getLanguage()],
   );
   // 拓展贡献的管理器页面：侧栏入口与对内置页面的顶替（见 extension-manager-pages.ts）。
   const extensionPages = useMemo(() => managerExtensionPages(settings?.user_scripts), [settings?.user_scripts]);
@@ -5302,7 +4770,10 @@ export function App() {
               const currentSettings = await run(() => call<SettingsResult>("load_settings"));
               if (!currentApp || !currentSettings || !isSuccessStatus(currentApp.status) || !isSuccessStatus(currentSettings.status)) return false;
               setOverview(currentApp);
-              acceptExternalSettings(currentSettings);
+              const fresh = normalizeSettings(currentSettings.settings);
+              const previous = normalizeSettings(settingsRef.current?.settings ?? currentSettings.settings);
+              setSettings(currentSettings);
+              setSettingsForm((current) => rebaseSettingsEdits(normalizeSettings(current), previous, fresh));
               return currentApp.codex_app.status === "found" && hasCodexEnhancements(currentSettings);
             }}
             onLaunch={() => codexAppRunning ? restart() : launch()}
@@ -5376,12 +4847,13 @@ export function App() {
             }
           }}
           onClose={() => setLegacyDisconnectOpen(false)}
+          onAddDirectProvider={() => setAddDirectProviderRequested(true)}
         />
       ) : null}
       {tourOpen && !agentFocusOpen ? <OnboardingTour focus={agentFocus} onClose={closeTour} /> : null}
       <main className="workspace">
         {relayCommonOpen ? (
-          <RelayCommonConfigScreen settings={settings} actions={actions} onBack={() => setRelayCommonOpen(false)} />
+          <RelayCommonConfigScreen onSave={saveCommonTemplate} onBack={() => setRelayCommonOpen(false)} />
         ) : null}
         <section
           style={relayCommonOpen ? { display: "none" } : undefined}
@@ -5433,6 +4905,8 @@ export function App() {
               旧入口 relayEnvironment 打开同一页并展开「高级」。 */}
           {route === "relay" || route === "relayEnvironment" ? (
             <RelayScreen
+              addDirectProviderRequested={addDirectProviderRequested}
+              onRequestedProviderOpened={() => setAddDirectProviderRequested(false)}
               settings={settings}
               relayFiles={relayFiles}
               envConflicts={envConflicts}
@@ -5505,6 +4979,19 @@ export function App() {
               onDeleteMany={actions.deleteLocalSessions}
               onArchiveMany={actions.archiveLocalSessions}
               onListProjectSessions={actions.listProjectSessions}
+              onPickFolder={async (title) => {
+                try {
+                  const selected = await open({ directory: true, multiple: false, title });
+                  return typeof selected === "string" && selected.trim() ? selected : null;
+                } catch (error) {
+                  showNotice(t("移动会话"), stringifyError(error), "failed");
+                  return null;
+                }
+              }}
+              onRelocated={async (message, ok) => {
+                showNotice(t("移动会话"), message, ok ? "ok" : "failed");
+                await actions.refreshLocalSessions(true, localSessions?.offset ?? 0);
+              }}
               repairPanel={<SessionRepairPanel dirty={settingsDirty} form={settingsForm} providerSyncProgress={providerSyncProgress}
                 sessionIndexRepairActive={sessionIndexRepairActive} sessionIndexRepairReport={sessionIndexRepairReport}
                 sessionIndexRepairReportError={sessionIndexRepairReportError} providerSyncTargets={providerSyncTargets}
@@ -5564,24 +5051,10 @@ export function App() {
             />
           ) : null}
           {route === "dreamSkin" ? (
-            <DreamSkinScreen
+            <DreamSkinRescueScreen
               form={settingsForm}
               launchPending={launchPending}
-              library={dreamSkinLibrary}
-              libraryLoading={dreamSkinLibraryLoading}
-              market={dreamSkinMarket}
-              marketLoading={dreamSkinMarketLoading}
-              community={dreamSkinCommunity}
-              communityLoading={dreamSkinCommunityLoading}
-              installOperation={dreamSkinInstallOperation}
-              draft={dreamSkinThemeDraft}
-              dirty={dreamSkinDraftDirty}
-              pendingRestart={pendingDreamSkinRestart}
-              selectedTheme={selectedDreamSkinTheme}
-              status={dreamSkinStatus}
-              verification={dreamSkinVerification}
-              onFormChange={setSettingsForm}
-              onDraftChange={setDreamSkinThemeDraft}
+              restartPending={dreamSkinRestartPending}
               actions={actions}
             />
           ) : null}
@@ -5598,6 +5071,9 @@ export function App() {
               onLaunchCodex={() => void (codexAppRunning ? restart() : launch())}
               onNavigate={(next) => void navigate(next)}
               onOpenAgent={(agent) => void switchTool(agent, agentEntryRoute(agent))}
+              autoTakeover={autoTakeover}
+              autoTakeoverOn={settings ? autoTakeoverOn : null}
+              watcherEnabled={watcher ? Boolean(watcher.enabled) : null}
             />
           ) : null}
           {route === "agentCache" ? <AgentCachePanel /> : null}
@@ -5624,7 +5100,10 @@ export function App() {
               }
               codexRun={codexRun}
               notify={actions.showMessage}
-              onOpenCodexProviderSettings={() => { void switchTool("codex", "relay"); }}
+              onOpenCodexProviderSettings={(addDirectProvider) => {
+                if (addDirectProvider) setAddDirectProviderRequested(true);
+                void switchTool("codex", "relay");
+              }}
               onTabChange={(tab) => void navigate(gatewayRouteByTab[tab])}
               tab={gatewayTabByRoute[route]}
             />
@@ -5771,29 +5250,6 @@ export function App() {
           }}
         />
       ) : null}
-      {dreamSkinUnsavedDialog ? (
-        <DreamSkinUnsavedDialog
-          onCancel={() => {
-            dreamSkinPendingActionRef.current = null;
-            setDreamSkinUnsavedDialog(false);
-          }}
-          onDiscard={() => {
-            const pending = dreamSkinPendingActionRef.current;
-            dreamSkinPendingActionRef.current = null;
-            setDreamSkinThemeDraft(savedDreamSkinThemeDraft);
-            setDreamSkinUnsavedDialog(false);
-            pending?.();
-          }}
-          onSave={() => void (async () => {
-            const saved = await saveDreamSkinThemeDraft();
-            if (!saved) return;
-            const pending = dreamSkinPendingActionRef.current;
-            dreamSkinPendingActionRef.current = null;
-            setDreamSkinUnsavedDialog(false);
-            pending?.();
-          })()}
-        />
-      ) : null}
       {pendingProviderImport ? (
         <PendingProviderImportDialog
           request={pendingProviderImport.request}
@@ -5803,8 +5259,7 @@ export function App() {
       ) : null}
       {pendingDreamSkinCommunity ? (
         <DreamSkinCommunityLinkDialog
-          installBlocked={Boolean(dreamSkinInstallOperation)}
-          installPending={dreamSkinInstallOperation?.source === "pending-community"}
+          installPending={dreamSkinCommunityInstalling}
           versionId={pendingDreamSkinCommunity}
           onConfirm={() => void confirmPendingDreamSkinCommunity()}
           onDismiss={() => void dismissPendingDreamSkinCommunity()}
@@ -5961,7 +5416,6 @@ type Actions = {
   performUpdate: () => Promise<void>;
   saveSettings: () => Promise<void>;
   saveSettingsValue: (settings: BackendSettings, silent?: boolean) => Promise<BackendSettings | null>;
-  saveCommonTemplate: (original: string, text: string) => Promise<BackendSettings | null>;
   autoSaveSettings: (settings: BackendSettings) => Promise<AutoSaveOutcome>;
   /// 乐观写入表单（不落盘）：拖拽排序松手时先让列表立即重排，落位动画才连贯。
   previewSettingsForm: (settings: BackendSettings) => void;
@@ -5973,25 +5427,7 @@ type Actions = {
   resetSettingsPath: () => Promise<void>;
   chooseCodexAppPath: (mode: "folder" | "file") => Promise<void>;
   clearCodexAppPath: () => Promise<void>;
-  chooseDreamSkinImagePath: () => Promise<void>;
-  resetDreamSkinImage: () => Promise<void>;
-  resetDreamSkinTheme: () => Promise<void>;
-  refreshDreamSkinLibrary: (silent?: boolean) => Promise<DreamSkinThemeLibrary | null>;
-  refreshDreamSkinMarket: (silent?: boolean) => Promise<DreamSkinMarketResult | null>;
-  installDreamSkinMarketTheme: (theme: DreamSkinMarketTheme) => Promise<boolean>;
-  refreshDreamSkinCommunity: (silent?: boolean) => Promise<DreamSkinCommunityResult | null>;
-  installDreamSkinCommunityTheme: (theme: DreamSkinCommunityTheme) => Promise<boolean>;
-  importDreamSkinThemePackage: () => Promise<void>;
-  createDreamSkinTheme: () => Promise<void>;
-  saveDreamSkinTheme: () => Promise<DreamSkinThemeDraft | null>;
-  selectDreamSkinTheme: (item: DreamSkinThemeSummary) => void;
-  renameDreamSkinTheme: (item: DreamSkinThemeSummary) => Promise<void>;
-  deleteDreamSkinTheme: (item: DreamSkinThemeSummary) => Promise<void>;
-  activateDreamSkinTheme: () => Promise<void>;
-  refreshDreamSkinStatus: (silent?: boolean) => Promise<DreamSkinRuntimeResult | null>;
   restoreDreamSkin: () => Promise<void>;
-  verifyDreamSkin: () => Promise<void>;
-  saveDreamSkinScreenshot: () => Promise<void>;
   saveManualCodexAppPath: () => Promise<void>;
   syncProvidersNow: () => Promise<void>;
   recoverProviderSync: () => Promise<void>;
@@ -6038,7 +5474,7 @@ type Actions = {
   deleteContextEntry: (settings: BackendSettings, kind: ContextKind, id: string) => Promise<BackendSettings | null>;
   previewMcpServersJson: (json: string) => Promise<McpImportPreviewResult | null>;
   importMcpServersJson: (settings: BackendSettings, json: string) => Promise<BackendSettings | null>;
-  extractRelayCommonConfig: (configContents: string, contextConfigContents: string) => Promise<ExtractRelayCommonConfigResult | null>;
+  extractRelayCommonConfig: (configContents: string) => Promise<ExtractRelayCommonConfigResult | null>;
   testRelayProfile: (profile: RelayProfile) => Promise<void>;
   diagnoseRelayProfile: (profile: RelayProfile) => Promise<ProviderDoctorResult | null>;
   fetchRelayProfileModels: (profile: RelayProfile) => Promise<string[] | null>;
@@ -8005,6 +7441,8 @@ function PoolLinkControl({ link, profileId }: { link: CodexPoolLink; profileId: 
 }
 
 function RelayScreen({
+  addDirectProviderRequested,
+  onRequestedProviderOpened,
   settings,
   relayFiles,
   envConflicts,
@@ -8016,6 +7454,8 @@ function RelayScreen({
   advancedOpen = false,
   onOpenGateway,
 }: {
+  addDirectProviderRequested: boolean;
+  onRequestedProviderOpened: () => void;
   settings: SettingsResult | null;
   relayFiles: RelayFilesResult | null;
   envConflicts: EnvConflictsResult | null;
@@ -8046,6 +7486,13 @@ function RelayScreen({
   const [detailProfileId, setDetailProfileId] = useState<string | null>(null);
   const [newProfileDraft, setNewProfileDraft] = useState<RelayProfile | null>(null);
   const [providerCatalogOpen, setProviderCatalogOpen] = useState(false);
+  useEffect(() => {
+    if (!addDirectProviderRequested) return;
+    setNewProfileDraft(null);
+    setDetailProfileId(null);
+    setProviderCatalogOpen(true);
+    onRequestedProviderOpened();
+  }, [addDirectProviderRequested, onRequestedProviderOpened]);
   // 目录页的搜索词放在这里：从模板进入编辑页再返回时，目录页会重新挂载，搜索不能丢。
   const [providerCatalogQuery, setProviderCatalogQuery] = useState("");
   // 进入时停在当前供应商所在的分区；找不到当前供应商时，没有直连项就展示协议转换分区。
@@ -8219,7 +7666,6 @@ function RelayScreen({
   if (detailProfile) {
     return (
       <RelayProfileDetail
-        key={detailProfile.id}
         profile={detailProfile}
         relayFiles={!isNewProfile && detailProfile.id === normalized.activeRelayId ? relayFiles : null}
         form={normalized}
@@ -8403,12 +7849,10 @@ function RelayScreen({
                 </div>
               ) : null}
             </div>
-            {takenOverByGateway ? null : (
-              <button className="cx-primary" onClick={() => { setNewProfileDraft(null); setDetailProfileId(null); setProviderCatalogOpen(true); }} type="button">
+              <button className="cx-primary" onClick={openCatalog} type="button">
                 <Plus />
-                {t("添加供应商")}
+                {takenOverByGateway ? t("添加直连供应商") : t("添加供应商")}
               </button>
-            )}
           </>
         )}
       />
@@ -8428,17 +7872,19 @@ function RelayScreen({
           <button className="cx-primary" onClick={() => void saveRelaySettings({ ...normalized, relayProfilesEnabled: true })} type="button">{t("打开配置切换")}</button>
         </CxBanner>
       ) : null}
-      {/* Codex 被网关接管：直连供应商整块隐藏，只留一行说明被谁接管、怎么回到直连。
-          直连供应商在接入期间不生效，改它们会让「断开并还原」出错；要编辑、删除去「多开」页，
-          要迁到网关去「供应商池」→「添加供应商 → 导入」。 */}
       {normalized.relayProfilesEnabled && takenOverByGateway ? (
         <CxCard className="cx-takeover">
           <CxEmpty
-            detail={tf("{0} 个直连供应商在接入网关期间不生效，已隐藏。点上方「直连」断开网关后恢复；要把它们加进供应商池，去「供应商池」→「添加供应商」→「导入」。", [directProfiles.length])}
+            detail={t("可以先添加或编辑直连档案。保存后继续使用网关，点上方「直连」预览并确认还原。")}
             title={t("Codex 正由 Codex++ 网关接管")}
           >
             {onOpenGateway ? <button className="cx-secondary" onClick={onOpenGateway} type="button">{t("打开供应商池")}</button> : null}
           </CxEmpty>
+          {directProfiles.map((profile) => (
+            <CxRow key={profile.id} title={profile.name || t("未命名供应商")} detail={relayProfileModeLabel(profile)}>
+              <button className="cx-secondary" onClick={() => void editRelayProfile(profile.id)} type="button">{t("编辑档案")}</button>
+            </CxRow>
+          ))}
         </CxCard>
       ) : null}
       {/* 总开关关闭时供应商切换不会写入 Codex：分页和列表都没有意义，整块隐藏，只留上方提示条。 */}
@@ -8613,7 +8059,6 @@ function CodexMultiLaunchScreen({
   if (detailProfile) {
     return (
       <RelayProfileDetail
-        key={detailProfile.id}
         profile={detailProfile}
         relayFiles={detailProfile.id === normalized.activeRelayId ? relayFiles : null}
         form={normalized}
@@ -8807,7 +8252,10 @@ function ProviderCatalogScreen({
     { id: "aggregator", label: t("聚合/中转") },
     { id: "third_party", label: t("第三方平台") },
   ];
-  const filteredPresets = PRESETS.filter((preset) => {
+  // 赞助商排在「聚合/中转」最前面。
+  const sponsors = useSponsorPresets();
+  const sponsorIds = new Set(sponsors.map((preset) => preset.id));
+  const filteredPresets = [...sponsors, ...PRESETS.filter((preset) => !sponsorIds.has(preset.id))].filter((preset) => {
     const haystack = `${preset.name} ${preset.baseUrl} ${preset.model}`.toLowerCase();
     return !query.trim() || haystack.includes(query.trim().toLowerCase());
   });
@@ -9215,1046 +8663,74 @@ function EnhancementSettingControl({
   );
 }
 
-function DreamSkinScreen({
+/// 皮肤的界面已移到 Codex 里（Codex++ → 设置 → 皮肤，见 96-dream-skin-page.js）。
+/// 管理器只留急救入口：皮肤把 Codex 弄得显示异常或打不开时，在这里恢复默认皮肤。
+function DreamSkinRescueScreen({
   form,
   launchPending,
-  library,
-  libraryLoading,
-  market,
-  marketLoading,
-  community,
-  communityLoading,
-  installOperation,
-  draft,
-  dirty,
-  pendingRestart,
-  selectedTheme,
-  status,
-  verification,
-  onFormChange,
-  onDraftChange,
+  restartPending,
   actions,
 }: {
   form: BackendSettings;
   launchPending: boolean;
-  library: DreamSkinThemeLibrary | null;
-  libraryLoading: boolean;
-  market: DreamSkinMarketResult | null;
-  marketLoading: boolean;
-  community: DreamSkinCommunityResult | null;
-  communityLoading: boolean;
-  installOperation: DreamSkinInstallOperation | null;
-  draft: DreamSkinThemeDraft | null;
-  dirty: boolean;
-  pendingRestart: PendingDreamSkinRestart | null;
-  selectedTheme: string;
-  status: DreamSkinRuntimeResult | null;
-  verification: DreamSkinVerificationResult | null;
-  onFormChange: (value: BackendSettings) => void;
-  onDraftChange: (value: DreamSkinThemeDraft | null) => void;
+  /** 恢复默认皮肤（或网页一键换肤）已保存，重启 Codex 才完整生效。 */
+  restartPending: boolean;
   actions: Actions;
 }) {
-  const [themeView, setThemeView] = useState<"market" | "community" | "local">("local");
-  const [localQuery, setLocalQuery] = useState("");
-  const companionInputRef = useRef<HTMLInputElement>(null);
-  const [companionError, setCompanionError] = useState("");
+  const { CxBadge, CxBanner, CxCard, CxRow, CxStatusIcon } = AgentCx;
   const masterEnabled = form.enhancementsEnabled;
-  const theme = draft?.config ?? defaultDreamSkinTheme();
-  const themeColors = theme.colors ?? defaultDreamSkinColors();
-  const customImagePath = draft?.imagePath.trim() ?? "";
-  const previewUrl = customImagePath
-    ? convertFileSrc(customImagePath)
-    : isWindowsPlatform
-      ? dreamSkinWindowsPreviewUrl
-      : dreamSkinMacPreviewUrl;
-  const selectedItem = library?.themes.find((item) => item.key === selectedTheme) ?? null;
-  const savedThemeSelected = selectedItem?.kind === "stored";
-  const updateTheme = (next: DreamSkinThemeConfig) => {
-    if (draft) onDraftChange({ ...draft, config: next });
-  };
-  const updateThemeText = (
-    key: "id" | "name" | "brandSubtitle" | "tagline" | "projectPrefix" | "projectLabel" | "statusText" | "quote",
-    value: string,
-  ) => updateTheme({ ...theme, [key]: value });
-  const updateThemeColor = (key: keyof DreamSkinColors, value: string) => {
-    updateTheme({ ...theme, colors: { ...themeColors, [key]: value } });
-  };
-  const themeAppearance = theme.appearance === "light" || theme.appearance === "dark"
-    ? theme.appearance
-    : "auto";
-  const windowsAccent = typeof theme.palette?.accent === "string" ? theme.palette.accent : "";
-  const updateWindowsAccent = (value: string) => {
-    const palette = { ...(theme.palette ?? {}) };
-    if (value.trim()) palette.accent = value;
-    else delete palette.accent;
-    const next: DreamSkinThemeConfig = { ...theme, palette };
-    if (!Object.keys(palette).length) delete next.palette;
-    updateTheme(next);
-  };
-  const companion = theme.companion;
-  const companionDataUrl = typeof companion?.dataUrl === "string" ? companion.dataUrl : "";
-  const companionEnabled = Boolean(companionDataUrl) && companion?.enabled !== false;
-  const updateCompanion = (patch: Partial<NonNullable<DreamSkinThemeConfig["companion"]>>) => {
-    const nextCompanion = {
-      dataUrl: companionDataUrl,
-      enabled: companion?.enabled ?? true,
-      width: companion?.width ?? 96,
-      side: companion?.side ?? "right",
-      offsetX: companion?.offsetX ?? 0,
-      offsetY: companion?.offsetY ?? 4,
-      ...patch,
-    };
-    updateTheme({ ...theme, companion: nextCompanion });
-  };
-  const clearCompanion = () => {
-    const next = { ...theme };
-    delete next.companion;
-    setCompanionError("");
-    updateTheme(next);
-  };
-  const chooseCompanion = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.currentTarget.files?.[0];
-    event.currentTarget.value = "";
-    if (!file) return;
-    if (!dreamSkinCompanionMimeTypes.has(file.type)) {
-      setCompanionError(t("仅支持 PNG、JPEG、WebP 或 GIF 图片"));
-      return;
-    }
-    const reader = new FileReader();
-    reader.onload = () => {
-      const dataUrl = typeof reader.result === "string" ? reader.result : "";
-      if (!dataUrl || dataUrl.length > dreamSkinCompanionDataUrlLimit) {
-        setCompanionError(t("图片过大，请选择 180 KB 以内的图片"));
-        return;
-      }
-      setCompanionError("");
-      updateCompanion({ dataUrl });
-    };
-    reader.onerror = () => setCompanionError(t("读取图片失败，请重新选择"));
-    reader.readAsDataURL(file);
-  };
-  const currentItem = library?.themes.find((item) => pendingRestart
-    ? item.key === pendingRestart.currentThemeKey
-    : item.active);
-  const currentThemeName = pendingRestart?.currentThemeName || currentItem?.name || t("未记录");
-  const currentThemeLabel = status?.liveApplied
-    ? t("当前运行")
-    : pendingRestart ? t("此前配置") : t("当前配置");
+  const skinActive = masterEnabled && form.codexAppDreamSkinEnabled && !form.codexAppDreamSkinPaused;
   const stateLabel = !masterEnabled
     ? t("增强总开关已关闭")
     : !form.codexAppDreamSkinEnabled
       ? t("皮肤未启用")
-      : form.codexAppDreamSkinPaused || status?.paused
+      : form.codexAppDreamSkinPaused
         ? t("已恢复原始外观")
-        : status ? dreamSkinStateLabel(status.state) : t("等待状态检查");
-  const stateTone = !masterEnabled || !form.codexAppDreamSkinEnabled || form.codexAppDreamSkinPaused || status?.paused
-    ? "disabled"
-    : status?.state === "pass" ? "pass" : status?.state === "fail" ? "fail" : status ? "warning" : "unchecked";
-  const localThemes = (library?.themes ?? []).filter((item) =>
-    !localQuery.trim() || item.name.toLocaleLowerCase().includes(localQuery.trim().toLocaleLowerCase()),
-  );
-  // 数据未就绪或正在刷新时，tab 计数显示转圈而不是 0，避免被误读成空列表。
-  const libraryPending = libraryLoading || !library;
-  const marketPending = marketLoading || !market;
-  const communityPending = communityLoading || !community;
-  const libraryCount = library?.themes.length ?? 0;
-  const marketCount = market?.themes.length ?? 0;
-  const communityCount = community?.items.length ?? 0;
-  const runtimeChecks = status?.checks ?? [];
-  const verificationChecks = verification?.checks ?? [];
-
-  const { CxBadge, CxBanner, CxCard, CxEmpty, CxRow, CxStatusIcon, CxToolbar } = AgentCx;
-  const stateDot = stateTone === "pass" ? "ok" : stateTone === "fail" ? "danger" : stateTone === "warning" ? "warn" : "off";
-  const draftStateLabel = dirty ? t("有未保存修改") : savedThemeSelected ? t("已保存主题") : draft?.builtin ? t("内置主题") : t("当前未保存主题");
-  const viewTab = (view: "local" | "community" | "market", icon: ReactNode, label: string, count: ReactNode) => (
-    <button
-      aria-selected={themeView === view}
-      className={themeView === view ? "is-active" : ""}
-      data-active={themeView === view}
-      onClick={() => setThemeView(view)}
-      role="tab"
-      type="button"
-    >
-      {icon}
-      {label}
-      {count}
-    </button>
-  );
+        : t("皮肤已启用");
+  const themeName = form.codexAppDreamSkinThemeConfig?.name?.trim() || t("未记录");
 
   return (
     <div className="cx-page dream-skin-page">
-      {/* 顶部最多一条提示：总开关关闭 > 有待重启应用的主题。 */}
-      {!masterEnabled ? (
-        <CxBanner icon={<Info />} title={t("请先在 Codex增强 页面开启总开关。")} tone="warn" />
-      ) : pendingRestart ? (
+      <CxBanner
+        icon={<Info />}
+        title={t("皮肤已移到 Codex 里：打开 Codex 左侧的 Codex++ → 设置 → 皮肤，可以换主题、装社区和市场主题、编辑主题。")}
+      />
+      {restartPending ? (
         <CxBanner
-          detail={`${currentThemeLabel}：${pendingRestart.currentThemeName}。${t("配置已保存，可以继续浏览和编辑，稍后重启即可生效。")}`}
+          detail={t("皮肤设置已保存，重启 Codex 后完整生效。")}
           icon={<Rocket />}
-          title={`${t("待应用主题")}：${pendingRestart.pendingThemeName}`}
+          title={t("需要重启 Codex")}
           tone="warn"
         >
           <button className="cx-primary" disabled={launchPending} onClick={() => void actions.restart()} type="button">
             <Rocket />
-            {t("重启并应用")}
+            {t("重启 Codex")}
           </button>
         </CxBanner>
       ) : null}
-
-      {/* 一行说完：左边是正在编辑的主题（缩略图带运行状态点）和当前运行的主题，右边是唯一的「应用」、菜单和皮肤开关。
-          原来「启用开关」「正在编辑」各占一行，两行说的是同一个皮肤。 */}
-      <CxCard className="dream-skin-overview">
+      <CxCard>
         <CxRow
-          badges={<CxBadge tone={dirty ? "warn" : "neutral"}>{draftStateLabel}</CxBadge>}
-          className="dream-skin-selected-row"
-          detail={<span role="status">{currentThemeLabel}：{currentThemeName} · {stateLabel}</span>}
-          icon={<CxStatusIcon tone={stateDot}><img alt={t("Dream Skin 图片预览")} className="dream-skin-selected-thumb" src={previewUrl} /></CxStatusIcon>}
-          title={<span title={theme.name}>{theme.name || t("未命名主题")}</span>}
+          badges={<CxBadge tone={skinActive ? "ok" : "neutral"}>{stateLabel}</CxBadge>}
+          detail={<span role="status">{tf("当前主题：{0}", [themeName])}</span>}
+          icon={<CxStatusIcon tone={skinActive ? "ok" : "off"}><Palette /></CxStatusIcon>}
+          title={t("当前皮肤")}
+        />
+        <CxRow
+          detail={t("皮肤让 Codex 显示异常或打不开时使用：关掉皮肤并清掉当前窗口里的皮肤，主题库不受影响；重启 Codex 后完整生效。")}
+          icon={<CxStatusIcon tone="warn"><RotateCcw /></CxStatusIcon>}
+          title={t("恢复默认皮肤")}
         >
-          <button className="cx-primary" disabled={!masterEnabled || !draft} onClick={() => void actions.activateDreamSkinTheme()} title={!masterEnabled ? t("请先在 Codex增强 页面开启总开关。") : t("保存并应用主题（皮肤没开时会一起打开）；需要重启时只会标记为待应用")} type="button">
-            <Play />
-            {pendingRestart ? t("更新待应用") : t("应用所选主题")}
+          <button className="cx-secondary" onClick={() => void actions.restoreDreamSkin()} type="button">
+            <RotateCcw />
+            {t("恢复默认皮肤")}
           </button>
-          <Menu>
-            <MenuItem disabled={!draft} onClick={() => void actions.saveDreamSkinTheme()}>
-              {draft?.builtin || selectedItem?.kind === "activeUnsaved" ? t("保存为新主题") : t("保存主题")}
-            </MenuItem>
-            <MenuItem onClick={() => void actions.refreshDreamSkinStatus()}>{t("刷新状态")}</MenuItem>
-            <MenuItem onClick={() => void actions.restoreDreamSkin()}>{t("恢复 Codex 外观")}</MenuItem>
-          </Menu>
-          <label className="switch-row compact dream-skin-enable-switch" title={t("启用 Codex 皮肤")}>
-            <span className="dream-skin-enable-label">{t("皮肤")}</span>
-            <input
-              aria-label={t("启用 Codex 皮肤")}
-              checked={form.codexAppDreamSkinEnabled}
-              disabled={!masterEnabled}
-              onChange={(event) => onFormChange({
-                ...form,
-                codexAppDreamSkinEnabled: event.currentTarget.checked,
-                codexAppDreamSkinPaused: false,
-              })}
-              type="checkbox"
-            />
-            <ToggleVisual />
-          </label>
         </CxRow>
       </CxCard>
-
-      {/* 主题库：三个胶囊切换「我的 / 社区 / 市场」，右侧是当前视图的操作。 */}
-      <div className="cx-filters dream-skin-browser-toolbar">
-        <nav aria-label={t("主题视图")} className="tp-tabs cx-pills dream-skin-view-tabs" role="tablist">
-          {viewTab("local", <Palette className="h-4 w-4" />, t("我的主题"), (
-            <span className={libraryPending ? "is-loading" : "cx-pill-count"} title={libraryPending ? t("加载中…") : undefined}>
-              {libraryPending ? <Loader2 aria-hidden="true" className="h-3 w-3 animate-spin" /> : libraryCount}
-            </span>
-          ))}
-          {viewTab("community", <Github className="h-4 w-4" />, t("DreamSkin 社区"), (
-            <span className={communityPending ? "is-loading" : "cx-pill-count"} title={communityPending ? t("加载中…") : undefined}>
-              {communityPending ? <Loader2 aria-hidden="true" className="h-3 w-3 animate-spin" /> : communityCount}
-            </span>
-          ))}
-          {viewTab("market", <Store className="h-4 w-4" />, t("主题市场"), (
-            <span className={marketPending ? "is-loading" : "cx-pill-count"} title={marketPending ? t("加载中…") : undefined}>
-              {marketPending ? <Loader2 aria-hidden="true" className="h-3 w-3 animate-spin" /> : marketCount}
-            </span>
-          ))}
-        </nav>
-        {themeView === "market" ? (
-          <div className="cx-filters-trailing">
-            <button className="cx-secondary" onClick={() => void actions.refreshDreamSkinMarket()} type="button">
-              <RefreshCw />
-              {t("刷新市场")}
-            </button>
-            <button className="cx-secondary" onClick={() => void actions.openExternalUrl(market?.repositoryUrl || "https://github.com/BigPizzaV3/CodexPlusPlus-Themes")} type="button">
-              <Github />
-              {t("投稿主题")}
-            </button>
-          </div>
-        ) : null}
-      </div>
-
-      {themeView === "local" ? (
-        <CxToolbar onQuery={setLocalQuery} placeholder={t("搜索主题名称")} query={localQuery}>
-          <button className="cx-secondary dream-skin-toolbar-button" disabled={Boolean(installOperation)} onClick={() => void actions.importDreamSkinThemePackage()} type="button">
-            {installOperation?.source === "import"
-              ? <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />
-              : <PackageOpen className="h-4 w-4" />}
-            {installOperation?.source === "import" ? t("导入中…") : t("导入主题包")}
-          </button>
-          <button className="cx-primary" onClick={() => void actions.createDreamSkinTheme()} type="button">
-            <ImagePlus className="h-4 w-4" />
-            {t("从图片创建")}
-          </button>
-        </CxToolbar>
-      ) : null}
-
-      {installOperation ? (
-        <DreamSkinInstallProgress label={dreamSkinInstallOperationLabel(installOperation)} />
-      ) : null}
-
-      {themeView === "community" ? (
-        <DreamSkinCommunitySection
-          community={community}
-          communityLoading={communityLoading}
-          installOperation={installOperation}
-          actions={actions}
-          onInstalled={() => setThemeView("local")}
-        />
-      ) : themeView === "market" ? (
-        <section className="dream-skin-market">
-          <p className="dream-skin-market-meta">
-            {market?.updatedAt
-              ? tf("清单更新于 {0}，安装后会保存到“我的主题”。", [market.updatedAt])
-              : t("从 CodexPlusPlus-Themes 仓库加载可安装主题。")}
-          </p>
-          {market?.cached || market?.warning ? (
-            <div className="dream-skin-market-warning">
-              <Info className="h-4 w-4" />
-              <span>{market.warning || t("远程仓库暂不可用，当前显示本地缓存。")}</span>
-            </div>
-          ) : null}
-          {market?.themes.length ? (
-            <div className="dream-skin-market-grid">
-              {market.themes.map((item) => (
-                <DreamSkinMarketCard
-                  actions={actions}
-                  installOperation={installOperation}
-                  key={item.id}
-                  onInstalled={() => setThemeView("local")}
-                  theme={item}
-                />
-              ))}
-            </div>
-          ) : (
-            <CxCard>
-              <CxEmpty title={market?.status === "failed" ? market.message : (
-                <span className="dream-skin-loading" role="status">
-                  {marketPending ? <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" /> : null}
-                  {t("正在加载主题市场…")}
-                </span>
-              )} />
-            </CxCard>
-          )}
-        </section>
-      ) : (
-        <>
-          <section
-            className="dream-skin-theme-library"
-            title={pendingRestart
-              ? t("选择其他卡片可继续调整待应用主题；当前界面不会自动重启。")
-              : t("选择卡片只会载入草稿；需要完整切换时会保存为待应用主题。")}
-          >
-            <div className="dream-skin-theme-list">
-              {localThemes.map((item) => {
-                const cardPreview = item.previewPath
-                  ? convertFileSrc(item.previewPath)
-                  : isWindowsPlatform
-                    ? dreamSkinWindowsPreviewUrl
-                    : dreamSkinMacPreviewUrl;
-                const cardDirty = item.key === selectedTheme && dirty;
-                const currentRunning = pendingRestart
-                  ? pendingRestart.currentThemeKey === item.key
-                  : item.active;
-                const pendingApplication = pendingRestart?.pendingThemeKey === item.key;
-                return (
-                  <article
-                    className={`dream-skin-theme-card${item.key === selectedTheme ? " is-selected" : ""}${currentRunning ? " is-current" : ""}${pendingApplication ? " is-pending" : ""}`}
-                    key={item.key}
-                  >
-                    <button
-                      aria-pressed={item.key === selectedTheme}
-                      className="dream-skin-theme-select"
-                      onClick={() => actions.selectDreamSkinTheme(item)}
-                      type="button"
-                    >
-                      <span className="dream-skin-theme-image">
-                        <img alt={item.name} loading="lazy" src={cardPreview} />
-                        {currentRunning || pendingApplication ? (
-                          <span className="dream-skin-theme-badges">
-                            {currentRunning ? <b>{currentThemeLabel}</b> : null}
-                            {pendingApplication ? <b className="is-pending">{t("待应用")}</b> : null}
-                          </span>
-                        ) : null}
-                      </span>
-                      <span className="dream-skin-theme-copy">
-                        <strong title={item.name}>{item.name}</strong>
-                        <small>
-                          {item.builtin
-                            ? t("内置主题")
-                            : item.kind === "activeUnsaved"
-                              ? t("当前未保存主题")
-                              : t("用户主题")}
-                        </small>
-                      </span>
-                      {item.modified || cardDirty ? <em>{t("已修改")}</em> : null}
-                    </button>
-                    {item.kind === "stored" ? (
-                      <details className="dream-skin-theme-menu" data-popover-menu="">
-                        <summary aria-label={tf("主题操作：{0}", [item.name])} title={t("主题操作")}><MoreHorizontal className="h-4 w-4" /></summary>
-                        <div>
-                          <button onClick={() => void actions.renameDreamSkinTheme(item)} type="button">
-                            <Edit3 className="h-4 w-4" />
-                            {t("重命名")}
-                          </button>
-                          <button disabled={item.active || currentRunning} onClick={() => void actions.deleteDreamSkinTheme(item)} type="button">
-                            <Trash2 className="h-4 w-4" />
-                            {t("删除")}
-                          </button>
-                        </div>
-                      </details>
-                    ) : null}
-                  </article>
-                );
-              })}
-            </div>
-            {!library ? (
-              <CxCard>
-                <CxEmpty title={(
-                  <span className="dream-skin-loading" role="status">
-                    <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />
-                    {t("正在加载主题库…")}
-                  </span>
-                )} />
-              </CxCard>
-            ) : null}
-            {library && !localThemes.length ? (
-              <CxCard>
-                <CxEmpty title={t("没有匹配的主题")}>
-                  <button className="cx-secondary" onClick={() => setLocalQuery("")} type="button">{t("清除搜索")}</button>
-                </CxEmpty>
-              </CxCard>
-            ) : null}
-          </section>
-
-          <details className="dream-skin-customizer">
-            <summary>
-              <span className="dream-skin-customizer-title">
-                <Settings className="h-4 w-4" />
-                <span>
-                  <strong>{t("自定义主题")}</strong>
-                  <small>{t("图片、文字和配色等高级编辑项")}</small>
-                </span>
-              </span>
-              {dirty ? <em className="is-dirty">{t("有未保存修改")}</em> : null}
-                </summary>
-            <div className="dream-skin-customizer-content">
-              <div className="dream-skin-platform-note">
-                <Info className="h-4 w-4" />
-                <span>
-                  {isWindowsPlatform
-                    ? t("Windows 使用亮暗模式、图片取色和可选强调色；完整色板仅在 macOS 生效。")
-                    : t("macOS 会应用主题中的图片、文字和颜色配置。")}
-                </span>
-              </div>
-
-              <div className="dream-skin-editor-layout">
-                <div className="dream-skin-media-editor">
-                  <div
-                    className="dream-skin-preview"
-                    style={isWindowsPlatform ? undefined : { backgroundColor: themeColors.background }}
-                  >
-                    <img alt={t("Dream Skin 图片预览")} src={previewUrl} />
-                    <span style={isWindowsPlatform ? undefined : { backgroundColor: themeColors.panel, color: themeColors.text }}>
-                      <strong>{theme.name}</strong>
-                      <small style={isWindowsPlatform ? undefined : { color: themeColors.muted }}>{customImagePath ? t("自定义托管图片") : t("目标项目默认图片")}</small>
-                    </span>
-                  </div>
-                  <RelayFold className="relay-config-section dream-skin-image-info" title={t("图片信息")}>
-                    <Field label={t("托管图片路径")}>
-                      <Input
-                        readOnly
-                        placeholder={t("使用目标项目默认图片")}
-                        value={draft?.imagePath ?? ""}
-                      />
-                    </Field>
-                  </RelayFold>
-                  <Toolbar>
-                    <Button variant="secondary" onClick={() => void actions.chooseDreamSkinImagePath()}>
-                      <Camera className="h-4 w-4" />
-                      {t("导入图片")}
-                    </Button>
-                    <Button
-                      disabled={!customImagePath}
-                      variant="outline"
-                      onClick={() => void actions.resetDreamSkinImage()}
-                    >
-                      <RotateCcw className="h-4 w-4" />
-                      {t("恢复默认图片")}
-                    </Button>
-                  </Toolbar>
-                </div>
-
-                <div className="dream-skin-edit-sections">
-                  <details className="dream-skin-edit-section">
-                    <summary><ChevronDown aria-hidden="true" className="dream-skin-edit-chevron h-4 w-4" /><strong>{t("输入框旁照片")}</strong></summary>
-                    <div className="dream-skin-edit-section-body">
-                      <div className="dream-skin-companion-controls">
-                        <div className="dream-skin-companion-heading">
-                          <div>
-                            <small>{t("为主题选择一张显示在 Codex 输入框旁的自定义照片")}</small>
-                          </div>
-                          {companionDataUrl ? (
-                            <img alt={t("输入框旁照片预览")} src={companionDataUrl} />
-                          ) : null}
-                        </div>
-                        <input
-                          accept="image/png,image/jpeg,image/webp,image/gif"
-                          className="sr-only"
-                          onChange={chooseCompanion}
-                          ref={companionInputRef}
-                          type="file"
-                        />
-                        <Toolbar>
-                          <Button onClick={() => companionInputRef.current?.click()} type="button" variant="secondary">
-                            <Camera className="h-4 w-4" />
-                            {companionDataUrl ? t("更换照片") : t("选择照片")}
-                          </Button>
-                          <Button disabled={!companionDataUrl} onClick={clearCompanion} type="button" variant="outline">
-                            <Trash2 className="h-4 w-4" />
-                            {t("清除照片")}
-                          </Button>
-                        </Toolbar>
-                        {companionError ? <small className="dream-skin-companion-error">{companionError}</small> : null}
-                        <div className="dream-skin-companion-fields">
-                          <label className="switch-row compact">
-                            <input
-                              checked={companionEnabled}
-                              disabled={!companionDataUrl}
-                              onChange={(event) => updateCompanion({ enabled: event.currentTarget.checked })}
-                              type="checkbox"
-                            />
-                            <span>
-                              <strong>{t("显示在输入框旁")}</strong>
-                              <small>{t("应用主题后显示在输入框的左侧或右侧")}</small>
-                            </span>
-                            <ToggleVisual />
-                          </label>
-                          <Field label={t("照片宽度") }>
-                            <Input
-                              disabled={!companionDataUrl}
-                              inputMode="numeric"
-                              max={160}
-                              min={48}
-                              type="number"
-                              value={companion?.width ?? 96}
-                              onChange={(event) => updateCompanion({ width: Math.max(48, Math.min(160, Number(event.currentTarget.value) || 96)) })}
-                            />
-                          </Field>
-                          <Field label={t("显示位置") }>
-                            <AppSelect
-                              disabled={!companionDataUrl}
-                              value={companion?.side ?? "right"}
-                              onChange={(value) => updateCompanion({ side: value })}
-                              options={[
-                                { value: "auto", label: t("自动") },
-                                { value: "left", label: t("左侧") },
-                                { value: "right", label: t("右侧") },
-                              ]}
-                            />
-                          </Field>
-                          <Field label={t("水平偏移") }>
-                            <Input
-                              disabled={!companionDataUrl}
-                              inputMode="numeric"
-                              max={48}
-                              min={-48}
-                              type="number"
-                              value={companion?.offsetX ?? 0}
-                              onChange={(event) => updateCompanion({ offsetX: Math.max(-48, Math.min(48, Number(event.currentTarget.value) || 0)) })}
-                            />
-                          </Field>
-                          <Field label={t("垂直偏移") }>
-                            <Input
-                              disabled={!companionDataUrl}
-                              inputMode="numeric"
-                              max={160}
-                              min={-160}
-                              type="number"
-                              value={companion?.offsetY ?? 4}
-                              onChange={(event) => updateCompanion({ offsetY: Math.max(-160, Math.min(160, Number(event.currentTarget.value) || 0)) })}
-                            />
-                          </Field>
-                        </div>
-                      </div>
-
-                    </div>
-                  </details>
-                  <details className="dream-skin-edit-section">
-                    <summary><ChevronDown aria-hidden="true" className="dream-skin-edit-chevron h-4 w-4" /><strong>{t("界面文字")}</strong></summary>
-                    <div className="dream-skin-edit-section-body">
-                      <div className="dream-skin-text-grid">
-                        <Field label={t("主题 ID")}><Input readOnly={draft?.builtin || savedThemeSelected} value={theme.id} onChange={(event) => updateThemeText("id", event.currentTarget.value)} /></Field>
-                        <Field label={t("主题名称")}><Input value={theme.name} onChange={(event) => updateThemeText("name", event.currentTarget.value)} /></Field>
-                        <Field label={t("品牌副标题")}><Input value={theme.brandSubtitle} onChange={(event) => updateThemeText("brandSubtitle", event.currentTarget.value)} /></Field>
-                        <Field label={t("主题标语")}><Input value={theme.tagline} onChange={(event) => updateThemeText("tagline", event.currentTarget.value)} /></Field>
-                        <Field label={t("项目前缀")}><Input value={theme.projectPrefix} onChange={(event) => updateThemeText("projectPrefix", event.currentTarget.value)} /></Field>
-                        <Field label={t("项目按钮文字")}><Input value={theme.projectLabel} onChange={(event) => updateThemeText("projectLabel", event.currentTarget.value)} /></Field>
-                        <Field label={t("状态文字")}><Input value={theme.statusText} onChange={(event) => updateThemeText("statusText", event.currentTarget.value)} /></Field>
-                        <Field label={t("引用文字")}><Input value={theme.quote} onChange={(event) => updateThemeText("quote", event.currentTarget.value)} /></Field>
-                      </div>
-                    </div>
-                  </details>
-                  <details className="dream-skin-edit-section">
-                    <summary><ChevronDown aria-hidden="true" className="dream-skin-edit-chevron h-4 w-4" /><strong>{t("主题配色")}</strong></summary>
-                    <div className="dream-skin-edit-section-body">
-                      {isWindowsPlatform ? (
-                        <div className="dream-skin-windows-theme-controls">
-                          <Field label={t("外观模式")}>
-                            <div aria-label={t("外观模式")} className="segmented dream-skin-appearance-options" role="group">
-                              {([
-                                ["auto", t("自动")],
-                                ["light", t("亮色")],
-                                ["dark", t("暗色")],
-                              ] as const).map(([value, label]) => (
-                                <button
-                                  aria-pressed={themeAppearance === value}
-                                  className={themeAppearance === value ? "active" : ""}
-                                  key={value}
-                                  onClick={() => updateTheme({ ...theme, appearance: value })}
-                                  type="button"
-                                >
-                                  {label}
-                                </button>
-                              ))}
-                            </div>
-                          </Field>
-                          <div className="dream-skin-windows-accent">
-                            <DreamSkinColorField
-                              label={t("强调色")}
-                              value={windowsAccent}
-                              onChange={updateWindowsAccent}
-                            />
-                            <Button
-                              disabled={!windowsAccent.trim()}
-                              onClick={() => updateWindowsAccent("")}
-                              size="sm"
-                              variant="outline"
-                            >
-                              <RotateCcw className="h-4 w-4" />
-                              {t("跟随图片配色")}
-                            </Button>
-                          </div>
-                          <small className="dream-skin-windows-theme-note">
-                            {t("亮暗模式直接控制 Codex 外观；强调色留空时自动从主题图片提取。")}
-                          </small>
-                        </div>
-                      ) : (
-                        <div className="dream-skin-colors">
-                          {dreamSkinColorFields().map(([key, label]) => (
-                            <DreamSkinColorField
-                              key={key}
-                              label={label}
-                              value={String(themeColors[key])}
-                              onChange={(value) => updateThemeColor(key, value)}
-                            />
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  </details>
-                </div>
-              </div>
-              <div className="dream-skin-editor-footer">
-              <Toolbar>
-                <Button disabled={!draft} onClick={() => void actions.saveDreamSkinTheme()}>
-                  <Save className="h-4 w-4" />
-                  {draft?.builtin || selectedItem?.kind === "activeUnsaved" ? t("保存为新主题") : t("保存主题")}
-                </Button>
-                <Button variant="outline" onClick={() => void actions.resetDreamSkinTheme()}>
-                  <RotateCcw className="h-4 w-4" />
-                  {isWindowsPlatform ? t("恢复 Codex 默认配色") : t("恢复 Dream Skin 默认主题")}
-                </Button>
-              </Toolbar>
-              </div>
-            </div>
-          </details>
-        </>
-      )}
-      <details className="dream-skin-diagnostics-fold">
-        <summary>
-          <span className="dream-skin-customizer-title">
-            <ShieldCheck className="h-4 w-4" />
-            <span>
-              <strong>{t("诊断与验证")}</strong>
-              <small>{t("检查官方应用身份、CDP renderer、目标样式和页面布局")}</small>
-            </span>
-          </span>
-        </summary>
-        <div className="dream-skin-customizer-content">
-          <div className="dream-skin-diagnostics-grid">
-            <DreamSkinCheckList title={t("运行诊断")} checks={runtimeChecks} emptyText={t("刷新状态后显示运行诊断。")}/>
-            <DreamSkinCheckList title={t("最近实机验证")} checks={verificationChecks} emptyText={t("运行实机验证后显示页面检查结果。")}/>
-          </div>
-          {verification ? (
-            <div className="dream-skin-verification-meta">
-              <span><small>{t("注入版本")}</small><code>{verification.version || t("未检测到")}</code></span>
-              <span><small>{t("截图路径")}</small><code>{verification.screenshotPath || t("未保存截图")}</code></span>
-            </div>
-          ) : null}
-          <div className="dream-skin-fold-actions">
-            <button className="cx-secondary" onClick={() => void actions.refreshDreamSkinStatus()} type="button">
-              <RefreshCw />
-              {t("刷新诊断")}
-            </button>
-            <button className="cx-secondary" onClick={() => void actions.saveDreamSkinScreenshot()} type="button">
-              <Camera />
-              {t("保存截图")}
-            </button>
-            <button className="cx-primary" onClick={() => void actions.verifyDreamSkin()} type="button">
-              <ShieldCheck />
-              {t("实机验证")}
-            </button>
-          </div>
-        </div>
-      </details>
-      <p className="dream-skin-about" title={t("应用会保存当前图片与主题配置；恢复原始外观不会删除主题。")}>
+      <p className="dream-skin-about">
         {t("项目来源：Fei-Away/Codex-Dream-Skin · 原作者 Fei-Away · MIT License · 第三方图片需自行确认授权")}
       </p>
     </div>
   );
-}
-
-function DreamSkinColorField({
-  label,
-  value,
-  onChange,
-}: {
-  label: string;
-  value: string;
-  onChange: (value: string) => void;
-}) {
-  return (
-    <Field className="dream-skin-color-field" label={label}>
-      <span className="dream-skin-color-control">
-        <input
-          aria-label={label}
-          type="color"
-          value={dreamSkinPickerColor(value)}
-          onChange={(event) => onChange(event.currentTarget.value.toUpperCase())}
-        />
-        <Input value={value} onChange={(event) => onChange(event.currentTarget.value)} />
-      </span>
-    </Field>
-  );
-}
-
-function DreamSkinMarketCard({
-  theme,
-  actions,
-  installOperation,
-  onInstalled,
-}: {
-  theme: DreamSkinMarketTheme;
-  actions: Actions;
-  installOperation: DreamSkinInstallOperation | null;
-  onInstalled: () => void;
-}) {
-  const installing = installOperation?.source === "market" && installOperation.id === theme.id;
-  const installBlocked = Boolean(installOperation);
-  const status = theme.updateAvailable
-    ? t("可更新")
-    : theme.installed
-      ? theme.installedVersion
-        ? tf("已安装 {0}", [theme.installedVersion])
-        : t("已安装")
-      : t("未安装");
-  return (
-    <article className="dream-skin-market-card">
-      <div className="dream-skin-market-preview">
-        <img
-          alt={theme.name}
-          loading="lazy"
-          onError={(event) => {
-            event.currentTarget.onerror = null;
-            event.currentTarget.src = isWindowsPlatform ? dreamSkinWindowsPreviewUrl : dreamSkinMacPreviewUrl;
-          }}
-          src={theme.previewUrl}
-        />
-        <UiBadge variant={theme.updateAvailable ? "default" : theme.installed ? "secondary" : "outline"}>{status}</UiBadge>
-      </div>
-      <div className="dream-skin-market-copy">
-        <div className="dream-skin-market-title">
-          <strong title={theme.name}>{theme.name}</strong>
-          <span>v{theme.version}</span>
-        </div>
-        <small>{tf("作者：{0} · {1}", [theme.author, theme.license])}</small>
-        <p>{theme.description || t("暂无主题说明。")}</p>
-        <div className="dream-skin-market-tags">
-          {theme.tags.map((tag) => <span key={tag}>{tag}</span>)}
-        </div>
-      </div>
-      <div className="dream-skin-market-actions">
-        <Button
-          aria-busy={installing}
-          disabled={installBlocked}
-          onClick={async () => {
-            if (await actions.installDreamSkinMarketTheme(theme)) onInstalled();
-          }}
-          size="sm"
-        >
-          {installing
-            ? <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />
-            : <Download className="h-4 w-4" />}
-          {installing ? t("安装中…") : theme.updateAvailable ? t("更新") : theme.installed ? t("重新安装") : t("安装")}
-        </Button>
-        <Button onClick={() => void actions.openExternalUrl(theme.sourceUrl)} size="sm" variant="outline">
-          <ExternalLink className="h-4 w-4" />
-          {t("来源")}
-        </Button>
-        {installing ? <DreamSkinInstallProgress /> : null}
-      </div>
-    </article>
-  );
-}
-
-function DreamSkinCommunitySection({
-  community,
-  communityLoading,
-  installOperation,
-  actions,
-  onInstalled,
-}: {
-  community: DreamSkinCommunityResult | null;
-  communityLoading: boolean;
-  installOperation: DreamSkinInstallOperation | null;
-  actions: Actions;
-  onInstalled: () => void;
-}) {
-  const [query, setQuery] = useState("");
-  const [sort, setSort] = useState<"latest" | "popular" | "name">("latest");
-  const items = useMemo(() => {
-    const normalized = query.trim().toLowerCase();
-    const filtered = (community?.items ?? []).filter((item) => {
-      if (!normalized) return true;
-      return [item.name, item.authorDisplayName, item.themeId, item.license]
-        .some((value) => value.toLowerCase().includes(normalized));
-    });
-    return [...filtered].sort((left, right) => {
-      if (sort === "popular") return right.downloadCount - left.downloadCount;
-      if (sort === "name") return left.name.localeCompare(right.name, "zh-CN");
-      return right.reviewedAt.localeCompare(left.reviewedAt);
-    });
-  }, [community?.items, query, sort]);
-
-  const { CxCard, CxEmpty, CxToolbar } = AgentCx;
-  return (
-    <section
-      className="dream-skin-community"
-      title={community?.total
-        ? tf("来自 DreamSkin.cc 的已审核主题，共 {0} 套；安装前仍会在本机再次校验。", [String(community.total)])
-        : t("从 DreamSkin.cc 加载已审核主题包。")}
-    >
-      {/* 一条工具条：搜索 + 排序 + 刷新；两个外部链接收进三点菜单。 */}
-      <CxToolbar onQuery={setQuery} placeholder={t("搜索主题名称、作者或许可证")} query={query}>
-        <AppSelect
-          ariaLabel={t("社区主题排序")}
-          onChange={(value) => setSort(value as typeof sort)}
-          options={[
-            { value: "latest", label: t("最新审核") },
-            { value: "popular", label: t("下载最多") },
-            { value: "name", label: t("名称排序") },
-          ]}
-          size="sm"
-          title={t("社区主题排序")}
-          value={sort}
-        />
-        <button aria-label={t("刷新社区")} className="cx-icon-button" onClick={() => void actions.refreshDreamSkinCommunity()} title={t("刷新社区")} type="button">
-          <RefreshCw />
-        </button>
-        <Menu>
-          <MenuItem onClick={() => void actions.openExternalUrl("https://dreamskin.cc/gallery")}>{t("在线主题库")}</MenuItem>
-          <MenuItem onClick={() => void actions.openExternalUrl("https://dreamskin.cc/studio")}>{t("在线 Studio")}</MenuItem>
-        </Menu>
-      </CxToolbar>
-      {community?.warning ? (
-        <div className="dream-skin-market-warning">
-          <Info className="h-4 w-4" />
-          <span>{community.warning}</span>
-        </div>
-      ) : null}
-      {items.length ? (
-        <div className="dream-skin-community-grid">
-          {items.map((item) => (
-            <DreamSkinCommunityCard
-              actions={actions}
-              installOperation={installOperation}
-              key={item.id}
-              onInstalled={onInstalled}
-              theme={item}
-            />
-          ))}
-        </div>
-      ) : (
-        <CxCard>
-          <CxEmpty title={!community || communityLoading ? (
-            <span className="dream-skin-loading" role="status">
-              <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />
-              {t("正在加载 DreamSkin 社区…")}
-            </span>
-          ) : community.status === "failed"
-            ? community.message
-            : query.trim()
-              ? t("没有匹配的社区主题。")
-              : t("DreamSkin 社区暂时没有可用主题。")}
-          >
-            {query.trim() ? <button className="cx-secondary" onClick={() => setQuery("")} type="button">{t("清除搜索")}</button> : null}
-          </CxEmpty>
-        </CxCard>
-      )}
-    </section>
-  );
-}
-
-function DreamSkinCommunityCard({
-  theme,
-  actions,
-  installOperation,
-  onInstalled,
-}: {
-  theme: DreamSkinCommunityTheme;
-  actions: Actions;
-  installOperation: DreamSkinInstallOperation | null;
-  onInstalled: () => void;
-}) {
-  const installing = installOperation?.source === "community" && installOperation.id === theme.id;
-  const installBlocked = Boolean(installOperation);
-  const status = theme.updateAvailable
-    ? t("可更新")
-    : theme.installed
-      ? tf("已安装 {0}", [theme.installedVersion])
-      : t("未安装");
-  const packageSize = theme.packageBytes >= 1024 * 1024
-    ? `${(theme.packageBytes / 1024 / 1024).toFixed(1)} MiB`
-    : `${Math.ceil(theme.packageBytes / 1024)} KiB`;
-  return (
-    <article className="dream-skin-community-card">
-      <div className="dream-skin-community-preview">
-        <img
-          alt={theme.name}
-          loading="lazy"
-          onError={(event) => {
-            event.currentTarget.onerror = null;
-            event.currentTarget.src = isWindowsPlatform ? dreamSkinWindowsPreviewUrl : dreamSkinMacPreviewUrl;
-          }}
-          src={theme.previewUrl}
-        />
-        <UiBadge variant={theme.updateAvailable ? "default" : theme.installed ? "secondary" : "outline"}>{status}</UiBadge>
-      </div>
-      <div className="dream-skin-community-copy">
-        <div className="dream-skin-market-title">
-          <strong title={theme.name}>{theme.name}</strong>
-          <span>v{theme.version}</span>
-        </div>
-        <small>{tf("作者：{0} · {1} · {2} 次下载", [theme.authorDisplayName, theme.license, String(theme.downloadCount)])}</small>
-        <small>{tf("主题包：{0}", [packageSize])}</small>
-      </div>
-      <div className="dream-skin-community-actions">
-        <Button
-          aria-busy={installing}
-          disabled={installBlocked || !theme.applyCompatible}
-          onClick={async () => {
-            if (await actions.installDreamSkinCommunityTheme(theme)) onInstalled();
-          }}
-          size="sm"
-          title={theme.applyCompatible ? t("下载、校验并安装主题包") : t("此主题仅支持在线预览或下载")}
-        >
-          {installing
-            ? <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />
-            : <Download className="h-4 w-4" />}
-          {installing ? t("安装中…") : theme.updateAvailable ? t("更新") : theme.installed ? t("重新安装") : t("安装")}
-        </Button>
-        <Button onClick={() => void actions.openExternalUrl(`https://dreamskin.cc/preview?themeVersion=${encodeURIComponent(theme.id)}`)} size="sm" variant="outline">
-          <Eye className="h-4 w-4" />
-          {t("预览")}
-        </Button>
-        {installing ? <DreamSkinInstallProgress /> : null}
-      </div>
-    </article>
-  );
-}
-
-function dreamSkinInstallOperationLabel(operation: DreamSkinInstallOperation): string {
-  if (operation.source === "import") return t("正在导入并校验本地主题包…");
-  return tf("正在下载、校验并安装“{0}”…", [operation.name]);
-}
-
-function DreamSkinInstallProgress({ label = t("正在下载、校验并安装主题包…") }: { label?: string }) {
-  return (
-    <div aria-live="polite" className="dream-skin-install-progress" role="status">
-      <span>{label}</span>
-      <div aria-label={label} className="dream-skin-install-progress-bar" role="progressbar">
-        <div />
-      </div>
-    </div>
-  );
-}
-
-function DreamSkinCheckList({ title, checks, emptyText }: { title: string; checks: DreamSkinCheck[]; emptyText: string }) {
-  return (
-    <section className="dream-skin-check-section">
-      <strong>{title}</strong>
-      <div className="dream-skin-check-list">
-        {checks.length ? checks.map((check) => (
-          <div className={`dream-skin-check is-${check.level}`} key={`${title}-${check.id}`}>
-            {dreamSkinCheckIcon(check.level)}
-            <span>
-              <strong>{check.label}</strong>
-              <small>{check.message}</small>
-            </span>
-            <b>{dreamSkinCheckLevelLabel(check.level)}</b>
-          </div>
-        )) : <p className="empty">{emptyText}</p>}
-      </div>
-    </section>
-  );
-}
-
-function dreamSkinColorFields(): Array<[keyof DreamSkinColors, string]> {
-  return [
-    ["background", t("背景色")],
-    ["panel", t("面板色")],
-    ["panelAlt", t("次级面板色")],
-    ["accent", t("强调色")],
-    ["accentAlt", t("次级强调色")],
-    ["secondary", t("辅助色")],
-    ["highlight", t("高亮色")],
-    ["text", t("文字色")],
-    ["muted", t("弱化文字色")],
-    ["line", t("边线色")],
-  ];
-}
-
-function dreamSkinPickerColor(value: string): string {
-  const color = value.trim();
-  const hex = /^#([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i.exec(color);
-  if (hex) {
-    const digits = hex[1];
-    return digits.length === 3
-      ? `#${digits.split("").map((part) => `${part}${part}`).join("")}`
-      : `#${digits.slice(0, 6)}`;
-  }
-  const rgb = /^rgba?\(\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)/i.exec(color);
-  if (!rgb) return "#808080";
-  const channel = (raw: string) => Math.max(0, Math.min(255, Math.round(Number(raw)))).toString(16).padStart(2, "0");
-  return `#${channel(rgb[1])}${channel(rgb[2])}${channel(rgb[3])}`;
-}
-
-function dreamSkinCheckIcon(level: "pass" | "warning" | "fail") {
-  if (level === "pass") return <CheckCircle2 aria-hidden="true" className="h-4 w-4" />;
-  if (level === "fail") return <ShieldAlert aria-hidden="true" className="h-4 w-4" />;
-  return <Info aria-hidden="true" className="h-4 w-4" />;
-}
-
-function dreamSkinCheckLevelLabel(level: "pass" | "warning" | "fail"): string {
-  if (level === "pass") return t("通过");
-  if (level === "fail") return t("失败");
-  return t("警告");
-}
-
-function dreamSkinStateLabel(state: "pass" | "warning" | "fail" | "not_running"): string {
-  if (state === "pass") return t("已应用并通过检查");
-  if (state === "warning") return t("需要处理");
-  if (state === "fail") return t("验证失败");
-  return t("Codex 未运行或不可连接");
 }
 
 function UserScriptsScreen({ host, focus = null, onHostChange, settings, market, onOpenBuiltins, onOpenClaude, actions }: { host: ExtensionHost; focus?: AgentFocus; onHostChange: (host: ExtensionHost) => void; settings: SettingsResult | null; market: ScriptMarketResult | null; onOpenBuiltins: () => void; onOpenClaude: () => void; actions: Actions }) {
@@ -10915,6 +9391,9 @@ function HomeScreen({
   onLaunchCodex,
   onNavigate,
   onOpenAgent,
+  autoTakeover,
+  autoTakeoverOn,
+  watcherEnabled,
 }: {
   ads: AdsResult | null;
   actions: Actions;
@@ -10925,6 +9404,10 @@ function HomeScreen({
   onLaunchCodex: () => void;
   onNavigate: (route: Route) => void;
   onOpenAgent: (agent: ToolId) => void;
+  autoTakeover: AutoTakeoverResult | null;
+  /** 设置还没读到时为 null，开关先禁用。 */
+  autoTakeoverOn: boolean | null;
+  watcherEnabled: boolean | null;
 }) {
   const gateway = useGatewayPayload(10_000);
   const usage = useTodayUsage();
@@ -10948,11 +9431,45 @@ function HomeScreen({
     { route: "settings", label: t("设置"), detail: t("主题、更新、日志与诊断"), icon: Settings },
   ];
 
+  // 自动接管紧挨着 Codex 那一行：打开后自己直接开 Codex 也有增强，不必再从这里点启动。
+  // 关掉 Codex++ 就没人监听，所以没开登录自启时在这一行提醒并给开关。
+  const takeover = autoTakeoverView(autoTakeover);
+  const takeoverNeedsLogin = autoTakeoverOn === true && watcherEnabled === false;
+  const takeoverRow = (
+    <CxRow
+      badges={autoTakeoverOn ? <StatusBadge status={takeover.status} label={takeover.label} /> : null}
+      detail={autoTakeoverOn
+        ? [takeover.detail, takeoverNeedsLogin ? t("Codex++ 没有设为登录时打开，退出 Codex++ 后不会接管。") : ""].filter(Boolean).join(" ")
+        : enhancementPlatform === "windows"
+          ? t("打开后，直接打开 Codex（开始菜单、任务栏）也会自动接管并注入增强，不用再从 Codex++ 启动。")
+          : t("打开后，直接打开 Codex（Dock、启动台）也会自动接管并注入增强，不用再从 Codex++ 启动。")}
+      icon={<CxStatusIcon tone={autoTakeoverOn ? (takeover.status === "ok" ? "ok" : takeover.status === "failed" ? "danger" : "warn") : "off"}><Plug /></CxStatusIcon>}
+      key="codex-auto-takeover"
+      title={t("自动接管官方 App")}
+      tooltip={t("官方 App 已在运行且没有调试端口时，会先退出再带参数重开（可能中断正在进行的操作）。")}
+    >
+      {takeoverNeedsLogin ? (
+        <button className="cx-secondary" onClick={() => void actions.setWatcherEnabled(true)} type="button">{t("登录时打开 Codex++")}</button>
+      ) : null}
+      <label className="switch-row compact relay-master-switch relay-master-switch-compact">
+        <input
+          aria-label={t("开启自动接管")}
+          checked={autoTakeoverOn === true}
+          disabled={autoTakeoverOn === null}
+          onChange={(event) => void actions.setAutoTakeover(event.currentTarget.checked)}
+          type="checkbox"
+        />
+        <span>{t("自动接管")}</span>
+        <ToggleVisual />
+      </label>
+    </CxRow>
+  );
+
   const agentRow = (tool: ToolEntry) => {
     const viaGateway = connected.has(tool.id);
     if (tool.id === "codex") {
       const mode = viaGateway ? t("经网关") : tool.activeRelayName ? tf("直连 · {0}", [tool.activeRelayName]) : t("直连");
-      return (
+      return [
         <CxRow
           detail={`${codexRunning ? t("运行中") : t("未运行")} · ${mode}`}
           icon={<CxStatusIcon tone={codexRunning ? "ok" : "off"}><AgentGlyph agent="codex" className="home-agent-glyph" /></CxStatusIcon>}
@@ -10964,8 +9481,9 @@ function HomeScreen({
             {codexRunning ? <RotateCcw /> : <Play />}
             {codexRunning ? t("重启") : t("启动")}
           </button>
-        </CxRow>
-      );
+        </CxRow>,
+        takeoverRow,
+      ];
     }
     return (
       <CxRow
@@ -11126,16 +9644,7 @@ function MaintenanceScreen({
 }) {
   const savedCodexAppPath = settings?.settings.codexAppPath ?? "";
   const takeoverOn = Boolean(settings?.settings.codexAppAutoTakeover);
-  const takeoverStatus = autoTakeover?.state === "degraded" ? "failed" : autoTakeover?.running ? "ok" : "disabled";
-  // 接管状态压成一行：官方 App、调试端口、上次接管；需要注意的情况（出错、本次跳过、平台不支持）优先显示。
-  const takeoverDetail = autoTakeover?.lastError
-    || (autoTakeover?.pausedInstance ? t("本次已跳过自动接管，重启官方 App 后恢复。") : "")
-    || (autoTakeover && !autoTakeover.platformSupported ? t("自动接管目前只支持 macOS 和 Linux。") : "")
-    || [
-      `${t("官方 App")} ${autoTakeover?.appRunning ? t("运行中") : t("未运行")}`,
-      autoTakeover?.actualDebugPort ? `${t("调试端口")} ${autoTakeover.actualDebugPort}` : "",
-      autoTakeover?.lastTakeoverAtMs ? tf("上次接管：{0}", [new Date(autoTakeover.lastTakeoverAtMs).toLocaleString()]) : "",
-    ].filter(Boolean).join(" · ");
+  const takeover = autoTakeoverView(autoTakeover);
   return (
     <>
       {/* Codex 应用一行：识别到的路径 + 状态；换路径、清除保存的路径都在它的菜单里（原来「检查与修复」「应用路径」两节显示同一个路径三次）。 */}
@@ -11246,8 +9755,8 @@ function MaintenanceScreen({
           </label>
           {takeoverOn ? (
             <CxRow
-              badges={<StatusBadge status={takeoverStatus} label={autoTakeover?.state === "degraded" ? t("已降级") : autoTakeover?.running ? t("监听中") : t("未运行")} />}
-              detail={takeoverDetail}
+              badges={<StatusBadge status={takeover.status} label={takeover.label} />}
+              detail={takeover.detail}
               title={t("接管状态")}
               tooltip={t("仅在 Codex++ 正在运行时生效；需要重启官方 App 时会自动重启。")}
             >
@@ -11297,6 +9806,39 @@ function MaintenanceScreen({
       </CxSection>
     </>
   );
+}
+
+/**
+ * 自动接管的状态标签与一行说明（首页和设置页共用）。
+ * 说明里需要注意的情况优先：出错、本次跳过、平台不支持、为什么还没接管；都没有才显示官方 App、端口、上次接管。
+ * `lastReason` / 降级时的 `lastError` 是 Rust 判据的英文原因码（`auto_takeover::decide`），这里翻成人话。
+ */
+function autoTakeoverView(state: AutoTakeoverResult | null): { status: string; label: string; detail: string } {
+  const reasons: Record<string, string> = {
+    multi_instance: t("有另一个 Codex 实例在运行（多开或带调试端口启动的）；接管要先退出 Codex，会把它一起关掉，所以先不接管。"),
+    user_active: t("Codex 正在执行任务，等它空闲后再接管；也可以点「立即接管」。"),
+    probe_unknown: t("无法确认官方 App 状态，已保守跳过。"),
+    backoff: t("上次接管没有成功，稍后自动重试。"),
+    restart_budget_exhausted: t("一小时内接管次数已达上限，已停止自动重试。"),
+    injection_ready_failed: t("上次注入没有成功，重启 Codex 可以重新注入。"),
+    takeover: t("正在接管：退出官方 App 后带参数重开。"),
+  };
+  const reasonText = (code?: string | null) => (code ? reasons[code] ?? "" : "");
+  if (!state) return { status: "off", label: t("未运行"), detail: "" };
+  const attached = state.lastReason === "already_attached";
+  const detail = reasonText(state.lastError) || state.lastError
+    || (state.pausedInstance ? t("本次已跳过自动接管，重启官方 App 后恢复。") : "")
+    || (!state.platformSupported ? t("当前系统不支持自动接管。") : "")
+    || reasonText(state.lastReason)
+    || [
+      attached ? t("官方 App 已接管") : `${t("官方 App")} ${state.appRunning ? t("运行中") : t("未运行")}`,
+      state.actualDebugPort ? `${t("调试端口")} ${state.actualDebugPort}` : "",
+      state.lastTakeoverAtMs ? tf("上次接管：{0}", [new Date(state.lastTakeoverAtMs).toLocaleString()]) : "",
+    ].filter(Boolean).join(" · ");
+  if (state.state === "degraded") return { status: "failed", label: t("已降级"), detail };
+  if (state.state === "taking_over") return { status: "warning", label: t("接管中"), detail };
+  if (state.state === "paused") return { status: "warning", label: t("本次跳过"), detail };
+  return state.running ? { status: "ok", label: t("监听中"), detail } : { status: "off", label: t("未运行"), detail };
 }
 
 /// 状态小标签：沿用 statusLabel / statusClass 的文案与分级，换成 CxBadge 的四种色调。
@@ -11586,6 +10128,7 @@ function GlobalSettingsScreen({
             >
               <AppSelect ariaLabel={t("界面主题")} className="cx-set-select" onChange={(value) => actions.setThemePreference(value)} options={themeOptions} size="sm" value={themePreference} />
             </CxRow>
+            <DisplaySettings />
           </CxCard>
         </CxSection>
         <CxSection title={t("窗口与托盘")}>
@@ -12095,18 +10638,10 @@ function RelayProfileDetail({
 }) {
   const detailBodyRef = useRef<HTMLDivElement>(null);
   const [draft, setDraft] = useState<RelayProfile>(profile);
-  const common = useRelayCommonConfig(form.relayCommonConfigContents, actions);
-  const openedConfig = useRef(profile.configContents);
-  const liveDraftCommon = useRef<string | null>(null);
-  const configChanged = openedConfig.current !== profile.configContents
-    || (liveDraftCommon.current !== null && liveDraftCommon.current !== form.relayCommonConfigContents);
   const [modelWindowRows, setModelWindowRows] = useState<SortableModelWindowRow[]>(() =>
     modelWindowRowsFromProfile(profile.modelList, profile.modelWindows || "", profile.modelVlm, profile.modelAutoCompact)
       .map((row) => withModelRowSortId(row)),
   );
-  const loadedDraft = useRef({ profile: draft, rows: modelWindowRows });
-  const providerDirty = (draft !== loadedDraft.current.profile && JSON.stringify(draft) !== JSON.stringify(loadedDraft.current.profile))
-    || (modelWindowRows !== loadedDraft.current.rows && JSON.stringify(modelWindowRows) !== JSON.stringify(loadedDraft.current.rows));
   const [doctorResult, setDoctorResult] = useState<ProviderDoctorResult | null>(null);
   const [doctorOpen, setDoctorOpen] = useState(false);
   const [doctorRunning, setDoctorRunning] = useState(false);
@@ -12128,10 +10663,7 @@ function RelayProfileDetail({
   const unsavedRowEditsRef = useRef(false);
   const lastDetailProfileIdRef = useRef(profile.id);
   useEffect(() => {
-    if (configChanged && lastDetailProfileIdRef.current === profile.id) return;
-    openedConfig.current = profile.configContents;
     const useLiveFiles = isActive && profileUsesLiveFiles && relayFiles;
-    liveDraftCommon.current = useLiveFiles ? form.relayCommonConfigContents : null;
     const liveDraft = isAggregateRelayProfile(profile)
       ? normalizeAggregateRelayProfile(profile, form)
       : deriveRelayProfileFromFiles(
@@ -12147,21 +10679,18 @@ function RelayProfileDetail({
     const nextDraft = useLiveFiles && !isAggregateRelayProfile(liveDraft)
       ? applyRelayProfilePatchToFiles(liveDraft, { apiKey: storedApiKey })
       : liveDraft;
-    loadedDraft.current.profile = nextDraft;
     setDraft(nextDraft);
     const switchedProfile = lastDetailProfileIdRef.current !== profile.id;
     lastDetailProfileIdRef.current = profile.id;
     if (switchedProfile || !unsavedRowEditsRef.current) {
-      const rows = modelWindowRowsFromProfile(nextDraft.modelList, nextDraft.modelWindows || "", nextDraft.modelVlm, nextDraft.modelAutoCompact)
-        .map((row) => withModelRowSortId(row));
-      loadedDraft.current.rows = rows;
-      setModelWindowRows(rows);
+      setModelWindowRows(modelWindowRowsFromProfile(nextDraft.modelList, nextDraft.modelWindows || "", nextDraft.modelVlm, nextDraft.modelAutoCompact)
+        .map((row) => withModelRowSortId(row)));
     }
     // 依赖里刻意不放 profile.modelMetadata / 原始 relayFiles：元数据改动是本编辑器自己触发的
     // （删行会清该模型元数据），把它当依赖会让「删行 → 清元数据 → 重建行」把删掉的行加回来。
   }, [profile.id, profile.modelList, profile.modelWindows, profile.modelAutoCompact, profile.modelVlm, profileUsesLiveFiles, isActive, isNew, liveConfigContents, liveAuthContents]);
   const validationSettings = relaySettingsWithDraft(form, profile.id, draft, isNew);
-  const validationError = configChanged || common.conflict ? t("供应商配置已变更。请保留需要的草稿，再返回列表重新打开。") : relaySessionProviderValidation(draft)
+  const validationError = relaySessionProviderValidation(draft)
     ?? (isAggregateRelayProfile(draft)
       ? aggregateRelayProfileValidation(draft)
       : relayModelRoutesSettingsValidation(validationSettings));
@@ -12199,13 +10728,6 @@ function RelayProfileDetail({
   unsavedRowEditsRef.current = hasUnsavedModelChanges;
   const saveDraft = async () => {
     if (savingDraft) return;
-    if (!isNew && common.dirty && !providerDirty && !common.conflict) {
-      setSavingDraft(true);
-      try {
-        if (await common.save()) onSaved?.();
-      } finally { setSavingDraft(false); }
-      return;
-    }
     // 配置有误不再静默 return：把原因弹出来（按钮也不再因此禁用，见头部那一行提示）。
     if (isNew && isAggregateRelayProfile(draft) && aggregateMode === null) {
       void actions.showMessage(t("保存供应商"), t("先选择聚合类型（模型聚合 / 故障转移）再保存。"), "failed");
@@ -12236,7 +10758,7 @@ function RelayProfileDetail({
       if (requiresRestart && !(await appConfirm(t("此请求设置需要启动本地协议代理。保存后将立即重启 Codex，使设置安全生效。是否继续？"), { title: t("需要重启 Codex"), confirmText: t("保存并重启") }))) {
         return;
       }
-      const savedSettings = await common.save(contents => onFormChange({ ...next, relayCommonConfigContents: contents }));
+      const savedSettings = await onFormChange(next);
       if (!savedSettings) return;
       if (requiresRestart) {
         const restarted = await actions.restart(true);
@@ -12255,7 +10777,7 @@ function RelayProfileDetail({
     }
   };
   const switchDraft = () => {
-    if (isNew || common.dirty || validationError || modelRowsError) return;
+    if (isNew || validationError || modelRowsError) return;
     const draftWithWindows = draftWithModelRows();
     const normalizedDraft = isAggregateRelayProfile(draftWithWindows) ? normalizeAggregateRelayProfile(draftWithWindows, form) : deriveRelayProfileFromFiles(draftWithWindows);
     const previousActiveRelayId = form.activeRelayId;
@@ -12324,7 +10846,7 @@ function RelayProfileDetail({
           ) : isNew || form.activeRelayId === CODEX_GATEWAY_RELAY_ID ? null : (
             // 网关接管期间（从多开页进来编辑）不给「设为当前」：切走会绕过「断开并还原」（#2801）。
             <Button
-              disabled={actions.relaySwitching || common.dirty}
+              disabled={actions.relaySwitching}
               onClick={switchDraft}
               title={!form.relayProfilesEnabled ? t("供应商配置总开关已关闭，点击后按提示开启") : actions.relaySwitching ? t("供应商切换中") : undefined}
               variant={draft.id === form.activeRelayId ? "secondary" : "default"}
@@ -12370,10 +10892,6 @@ function RelayProfileDetail({
         )}
         {isAggregateRelayProfile(draft) ? null : (
         <RelayFileEditors
-          configChanged={configChanged || common.dirty || providerDirty || isNew || savingDraft}
-          saving={savingDraft}
-          commonContents={common.contents}
-          onCommonChange={common.change}
           contextProfile={profile}
           profile={draft}
           form={form}
@@ -12560,6 +11078,7 @@ function RelayProfileEditor({
     profile.strictResponsesReasoning === true,
     profile.stripImageGenerationTool === true,
     profile.stripResponsesImageDetail === true,
+    profile.stripResponsesOutputEncryptedContent === true,
     profile.disableToolSearch === true,
     profile.pureApiImageGeneration === true,
   ].filter(Boolean).length;
@@ -14155,6 +12674,10 @@ function RelayProfileEditor({
                     <input type="checkbox" checked={profile.stripResponsesImageDetail === true} onChange={(event) => updateDraft({ stripResponsesImageDetail: event.currentTarget.checked })} />
                     <span><strong>{t("移除 Responses 图片 detail 字段")}</strong><small>{t("部分 Responses 上游不认 OpenAI 的 input_image.detail，只会返回泛化的参数错误。开启后转发前从普通消息和工具输出里的图片块删除 detail，请求改走本地代理。默认关闭。")}</small></span><ToggleVisual />
                   </label>
+                  <label className="switch-row compact relay-switch-row relay-field-strip-responses-output-encrypted-content">
+                    <input type="checkbox" checked={profile.stripResponsesOutputEncryptedContent === true} onChange={(event) => updateDraft({ stripResponsesOutputEncryptedContent: event.currentTarget.checked })} />
+                    <span><strong>{t("不发送 output.encrypted_content（上游不支持时开启）")}</strong><small>{t("部分严格 Responses 上游不接受 Codex 请求 include 里的 output.encrypted_content，会整条返回 400。开启后只删除这一项，保留 reasoning.encrypted_content 和其他项，请求改走本地代理。Kimi 地址或模型名会自动处理。默认关闭。")}</small></span><ToggleVisual />
+                  </label>
                   <label className="switch-row compact relay-switch-row relay-field-disable-tool-search">
                     <input type="checkbox" checked={profile.disableToolSearch === true} onChange={(event) => updateDraft({ disableToolSearch: event.currentTarget.checked })} />
                     <span><strong>{t("不发送 tool_search（上游不支持时开启）")}</strong><small>{t("部分第三方 Responses 上游不认 Codex 的托管工具 tool_search，供应商测试能通过，但实际聊天会返回 400（tool type \"tool_search\" is not supported）。开启后模型目录关闭 supports_search_tool，Codex 改为直接列出 MCP 工具。Kimi 官方地址会自动处理。重启 Codex 后生效。默认关闭。")}</small></span><ToggleVisual />
@@ -15115,12 +13638,10 @@ function SyncedTextarea({
   value,
   onValueChange,
   className,
-  placeholder,
 }: {
   value: string;
   onValueChange: (value: string) => void;
   className?: string;
-  placeholder?: string;
 }) {
   const [localValue, setLocalValue] = useState(value);
   const isFocusedRef = useRef(false);
@@ -15136,7 +13657,6 @@ function SyncedTextarea({
   return (
     <Textarea
       className={className}
-      placeholder={placeholder}
       value={localValue}
       onBlur={() => {
         isFocusedRef.current = false;
@@ -15155,67 +13675,60 @@ function SyncedTextarea({
   );
 }
 
-function useRelayCommonConfig(original: string, actions: Actions) {
-  const [edit, setEdit] = useState<{ original: string; text: string } | null>(null);
-  const conflict = edit !== null && edit.original !== original;
-  return {
-    contents: edit?.text ?? original,
-    dirty: edit !== null,
-    conflict,
-    change: (text: string) => setEdit(previous => text === original ? null : { original: previous?.original ?? original, text }),
-    save: async (submitProfile?: (contents: string) => Promise<BackendSettings | null>) => {
-      if (conflict) return null;
-      const saved = submitProfile ? await submitProfile(edit?.text ?? original)
-        : edit ? await actions.saveCommonTemplate(edit.original, edit.text) : null;
-      if (saved && edit) {
-        setEdit(null);
-        await actions.showMessage(t("通用配置文件"), t("已保存。重新应用或切换到使用通用配置的供应商后生效。"), "ok");
-      }
-      return saved;
-    },
-  };
-}
-
-function RelayCommonConfigEditor({ contents, onChange, children }: {
-  contents: string; onChange: (text: string) => void; children?: ReactNode;
+function RelayCommonConfigScreen({ onSave, onBack }: {
+  onSave: (original: string, contents: string) => Promise<SettingsResult | null>;
+  onBack: () => void;
 }) {
-  return <>
-    <p className="relay-fold-description">{t("只保留非 MCP、插件的跨供应商配置；MCP&插件在独立页面管理。")}</p>
-    {children}
-    <SyncedTextarea className="relay-file-textarea" value={contents} onValueChange={onChange} placeholder={'model_verbosity = "low"'} />
-  </>;
-}
-
-function RelayCommonConfigScreen({ settings, actions, onBack }: { settings: SettingsResult | null; actions: Actions; onBack: () => void }) {
-  const form = settings && isSuccessStatus(settings.status) ? normalizeSettings(settings.settings) : null;
-  const common = useRelayCommonConfig(form?.relayCommonConfigContents ?? "", actions);
+  const [contents, setContents] = useState<string | null>(null);
+  const [draft, setDraft] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    void invoke<BackendSettings>("read_relay_common_config").then(settings => {
+      if (!cancelled) setContents(settings.relayCommonConfigContents ?? "");
+    }).catch(error => { if (!cancelled) setLoadError(stringifyError(error)); });
+    return () => { cancelled = true; };
+  }, []);
   const save = async () => {
+    if (contents === null || draft === null || saving) return;
     setSaving(true);
     try {
-      await common.save();
-    } finally { setSaving(false); }
+      const result = await onSave(contents, draft);
+      if (result) {
+        setContents(result.settings.relayCommonConfigContents ?? "");
+        setDraft(null);
+      }
+    } finally {
+      setSaving(false);
+    }
   };
-  return <section className="screen management-screen">
-    <header className="cx-page-head" data-tauri-drag-region="deep">
-      <div className="cx-page-title"><h1>{t("通用配置文件")}</h1></div>
-      <div className="topbar-actions">
-        <Button variant="ghost" onClick={onBack}>{t("返回列表")}</Button>
-        <Button disabled={!form || saving || !common.dirty || common.conflict} onClick={() => void save()}>{t("保存")}</Button>
-      </div>
-    </header>
-    {form ? <fieldset className="relay-common-config-body" disabled={saving}>
-      <RelayCommonConfigEditor contents={common.contents} onChange={common.change} />
-      {common.conflict ? <p role="alert">{t("供应商配置已变更。请保留需要的草稿，再返回列表重新打开。")}</p> : null}
-    </fieldset> : <p role={settings ? "alert" : "status"}>{settings?.message ?? t("正在读取…")}</p>}
-  </section>;
+  return (
+    <section className="screen management-screen">
+      <header className="cx-page-head" data-tauri-drag-region="deep">
+        <div className="cx-page-title"><h1>{t("通用配置文件")}</h1></div>
+        <div className="topbar-actions">
+          {contents !== null ? <Button type="button" disabled={draft === null || saving} onClick={() => void save()}>
+            <Save className="h-4 w-4" />
+            {t("保存")}
+          </Button> : null}
+          <Button variant="ghost" onClick={onBack}>{t("返回列表")}</Button>
+        </div>
+      </header>
+      {contents !== null
+        ? <fieldset className="min-w-0" disabled={saving}>
+            <SyncedTextarea
+              className="relay-file-textarea"
+              value={draft ?? contents}
+              onValueChange={text => setDraft(text === contents ? null : text)}
+            />
+          </fieldset>
+        : <p role={loadError ? "alert" : "status"}>{loadError ?? t("正在读取…")}</p>}
+    </section>
+  );
 }
 
 function RelayFileEditors({
-  configChanged,
-  saving,
-  commonContents,
-  onCommonChange,
   contextProfile,
   profile,
   form,
@@ -15225,24 +13738,19 @@ function RelayFileEditors({
   onProfileChange,
   actions,
 }: {
-  configChanged: boolean;
-  saving: boolean;
-  commonContents: string;
-  onCommonChange: (value: string) => void;
   contextProfile: RelayProfile;
   profile: RelayProfile;
   form: BackendSettings;
   isActive: boolean;
   profileId: string;
-  onFormChange: (value: BackendSettings) => Promise<BackendSettings | null>;
+  onFormChange: (value: BackendSettings) => void;
   onProfileChange: (value: RelayProfile) => void;
   actions: Actions;
 }) {
-  const draftSettings = { ...form, relayCommonConfigContents: commonContents };
-  const configPreview = effectiveRelayConfigPreview(profile, draftSettings, contextProfile);
+  const configPreview = effectiveRelayConfigPreview(profile, form, contextProfile);
   const entries = contextEntriesForProfile(form, contextProfile);
   return (
-    <fieldset className="relay-file-grid" disabled={saving}>
+    <div className="relay-file-grid">
       <RelayFold className="relay-file-panel relay-config-preview" sectionId="config-preview" title={t("config.toml 预览")}>
         <p className="relay-fold-description">
           {isActive ? t("当前供应商切换后会写入的预览；上下文开关变化会立即反映") : t("切换到此供应商时会写入的预览；上下文开关变化会立即反映")}
@@ -15253,7 +13761,7 @@ function RelayFileEditors({
           onValueChange={(value) => {
             const withoutCommon = stripCommonConfigTextFallback(
               value,
-              relayCombinedCommonConfig(draftSettings),
+              relayCombinedCommonConfig(form),
             );
             const configContents = stripContextEntriesFromConfig(withoutCommon, entries);
             onProfileChange(deriveRelayProfileFromFiles({
@@ -15270,14 +13778,15 @@ function RelayFileEditors({
         sectionId="common-config"
         title={t("通用配置文件")}
       >
-        <RelayCommonConfigEditor contents={commonContents} onChange={onCommonChange}>
+        <p className="relay-fold-description">
+          {t("只保留非 MCP、插件的跨供应商配置；MCP&插件在独立页面管理。点此展开编辑。")}
+        </p>
             <Button
-              disabled={configChanged}
               onClick={async () => {
-                const extracted = await actions.extractRelayCommonConfig(profile.configContents || "", form.relayContextConfigContents);
+                const extracted = await actions.extractRelayCommonConfig(profile.configContents || "");
                 if (!extracted) return;
-                const { commonConfigContents, contextConfigContents } = extracted;
-                if (!commonConfigContents.trim() && !contextConfigContents.trim()) {
+                const split = splitContextConfigText(extracted.commonConfigContents || "");
+                if (!split.common.trim() && !split.context.trim()) {
                   await actions.showMessage(t("通用配置文件"), t("当前供应商 config.toml 里没有可提取的通用配置。"), "failed");
                   return;
                 }
@@ -15287,14 +13796,13 @@ function RelayFileEditors({
                 };
                 const next = syncLegacyRelayFields({
                   ...form,
-                  relayCommonConfigContents: commonConfigContents || form.relayCommonConfigContents,
-                  relayContextConfigContents: contextConfigContents || form.relayContextConfigContents,
+                  relayCommonConfigContents: split.common,
+                  relayContextConfigContents: joinTomlSectionsRootFirst([form.relayContextConfigContents || "", split.context]),
                   relayProfiles: form.relayProfiles.map((item) => (item.id === profileId ? promotedProfile : item)),
                 });
-                if (await onFormChange(next)) {
-                  onProfileChange(promotedProfile);
-                  await actions.showMessage(t("通用配置文件"), t("已保存。重新应用或切换到使用通用配置的供应商后生效。"), "ok");
-                }
+                onFormChange(next);
+                onProfileChange(promotedProfile);
+                await actions.saveSettingsValue(next, false);
               }}
               size="sm"
               type="button"
@@ -15303,7 +13811,11 @@ function RelayFileEditors({
               <Download className="h-4 w-4" />
               {t("提取当前供应商配置")}
             </Button>
-        </RelayCommonConfigEditor>
+          <SyncedTextarea
+            className="relay-file-textarea"
+            value={form.relayCommonConfigContents}
+            onValueChange={(value) => onFormChange({ ...form, relayCommonConfigContents: value })}
+          />
       </RelayFold>
       <RelayFold className="relay-file-panel relay-auth-preview" defaultOpen sectionId="auth-preview" title="auth.json">
         <p className="relay-fold-description">
@@ -15319,7 +13831,7 @@ function RelayFileEditors({
           onValueChange={(value) => onProfileChange(deriveRelayProfileFromFiles({ ...profile, authContents: value }, "auth"))}
         />
       </RelayFold>
-    </fieldset>
+    </div>
   );
 }
 
@@ -15613,38 +14125,6 @@ function GuideList({ items }: { items: string[] }) {
           <p>{item}</p>
         </div>
       ))}
-    </div>
-  );
-}
-
-function DreamSkinUnsavedDialog({
-  onSave,
-  onDiscard,
-  onCancel,
-}: {
-  onSave: () => void;
-  onDiscard: () => void;
-  onCancel: () => void;
-}) {
-  return (
-    <div className="modal-backdrop" role="dialog" aria-modal="true">
-      <div className="modal-card">
-        <div className="modal-head">
-          <div>
-            <h2>{t("主题有未保存修改")}</h2>
-            <p className="modal-message">{t("保存修改后继续，或放弃修改。")}</p>
-          </div>
-          <button className="toast-close" onClick={onCancel} type="button">×</button>
-        </div>
-        <Toolbar>
-          <Button onClick={onSave}>
-            <Save className="h-4 w-4" />
-            {t("保存并继续")}
-          </Button>
-          <Button onClick={onDiscard} variant="secondary">{t("放弃修改")}</Button>
-          <Button onClick={onCancel} variant="outline">{t("取消")}</Button>
-        </Toolbar>
-      </div>
     </div>
   );
 }
@@ -15950,13 +14430,11 @@ function PendingProviderImportDialog({
 
 function DreamSkinCommunityLinkDialog({
   versionId,
-  installBlocked,
   installPending,
   onConfirm,
   onDismiss,
 }: {
   versionId: string;
-  installBlocked: boolean;
   installPending: boolean;
   onConfirm: () => void;
   onDismiss: () => void;
@@ -15979,7 +14457,7 @@ function DreamSkinCommunityLinkDialog({
           {t("链接不能携带任意下载地址、文件路径或命令；安装后主题会进入“我的主题”，不会自动重启 Codex。")}
         </div>
         <Toolbar>
-          <Button aria-busy={installPending} disabled={installBlocked} onClick={onConfirm}>
+          <Button aria-busy={installPending} disabled={installPending} onClick={onConfirm}>
             {installPending
               ? <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />
               : <Download className="h-4 w-4" />}
@@ -15988,9 +14466,17 @@ function DreamSkinCommunityLinkDialog({
           <Button disabled={installPending} onClick={onDismiss} variant="secondary">{t("取消")}</Button>
         </Toolbar>
         {installPending ? <DreamSkinInstallProgress /> : null}
-        {installBlocked && !installPending ? (
-          <div className="hint-line" role="status">{t("其他主题正在安装，请等待完成后再安装此主题。")}</div>
-        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function DreamSkinInstallProgress({ label = t("正在下载、校验并安装主题包…") }: { label?: string }) {
+  return (
+    <div aria-live="polite" className="dream-skin-install-progress" role="status">
+      <span>{label}</span>
+      <div aria-label={label} className="dream-skin-install-progress-bar" role="progressbar">
+        <div />
       </div>
     </div>
   );
@@ -16057,7 +14543,16 @@ type ClaudeLocalConfig = {
   codeShareHome?: boolean;
   /** 启动前把命令行建的会话加进 Desktop 的会话列表；不写按默认（开）。 */
   importCliSessions?: boolean;
+  /** Cowork 总开关；不写按默认（开）。 */
+  cowork?: boolean;
+  /** 合并式主页（Claude 的实验布局）；不写按默认（关）。 */
+  hubHome?: boolean;
+  /** 界面用哪个录制版本（build id）；空串按最新的。 */
+  template?: string;
 };
+
+/** 内嵌的一个录制版本；builtAt 是该版本前端的构建时间（秒）。 */
+type ClaudeTemplateVersion = { build: string; builtAt?: number | null };
 
 type ClaudeLocalStatus = {
   supported: boolean;
@@ -16071,6 +14566,11 @@ type ClaudeLocalStatus = {
   port?: number | null;
   caReady: boolean;
   caTrusted: boolean;
+  /** 系统级根证书（Cowork 虚拟机用）：只有 Windows 支持。 */
+  caMachineSupported?: boolean;
+  caMachineTrusted?: boolean;
+  /** 内嵌的录制版本，新的在前。 */
+  templates?: ClaudeTemplateVersion[];
   nodeAvailable: boolean;
   dictationReady: boolean;
   config: ClaudeLocalConfig;
@@ -16093,6 +14593,14 @@ const CLAUDE_DEFAULT_CONTEXT_WINDOW = 200_000;
 function formatContextWindow(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(value) || value <= 0) return "";
   return formatTokens(value).replace(/K$/, "k");
+}
+
+/** 录制版本的显示：前端构建日期 + build id，例如「2026-11-14 · a4ced7f85b」；没有构建时间时只显示 build id。 */
+function claudeTemplateLabel(template: ClaudeTemplateVersion): string {
+  if (!template.builtAt) return template.build;
+  const date = new Date(template.builtAt * 1000);
+  const day = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+  return `${day} · ${template.build}`;
 }
 
 /**
@@ -16252,7 +14760,7 @@ function ClaudeLocalizationScreen(
     claudeLocalMemo.autoDetected = true;
     void refreshLocal();
   }, []);
-  const localAction = async (action: "launch" | "stop" | "trust" | "untrust" | "prepare" | "sync_sessions") => {
+  const localAction = async (action: "launch" | "stop" | "trust" | "untrust" | "trust_machine" | "prepare" | "sync_sessions") => {
     if (localPending.current || pending.current) return;
     localPending.current = true;
     localGeneration.current++;
@@ -16521,6 +15029,7 @@ function ClaudeLocalizationScreen(
   const localTone = local?.connected ? "ok" : local?.config.enabled && local?.claudeRunning ? "warn" : "neutral";
   const canLaunchOriginal = Boolean(local?.supported && (!local.config.enabled || local.nodeAvailable));
   const localDisabled = localBusy !== null || busy !== null;
+  const localTemplates = local?.templates ?? [];
   const localDetail = local
     ? (local.supported ? `${t("原版版本")} ${local.version || t("未检测到")}` : t("未检测到支持的 Claude Desktop"))
       + ` · ${local.contextWindow != null && local.contextWindow > 0
@@ -16740,27 +15249,60 @@ function ClaudeLocalizationScreen(
                   )}
                 </div>
               </CxRow>
+              {/* Cowork 虚拟机以系统服务运行，只读系统级根证书：只有 Windows 需要，Cowork 关着时用不上。 */}
+              {(local.config.cowork ?? true) && local.caMachineSupported ? (
+                <CxRow
+                  badges={<CxBadge tone={local.caMachineTrusted ? "ok" : "neutral"}>{local.caMachineTrusted ? t("已安装") : t("未安装")}</CxBadge>}
+                  detail={t("Cowork 虚拟机以系统服务运行，只读取系统级根证书；安装需要管理员授权。")}
+                  title={t("系统证书")}
+                >
+                  {!local.caMachineTrusted ? (
+                    <div className="claude-l10n-actions">
+                      <button className="cx-secondary" disabled={localDisabled} onClick={() => void localAction("trust_machine")} type="button"><ShieldCheck />{t("安装系统证书")}</button>
+                    </div>
+                  ) : null}
+                </CxRow>
+              ) : null}
               <CxRow badges={<CxBadge tone={local.dictationReady ? "ok" : "neutral"}>{local.dictationReady ? t("已就绪") : t("未就绪")}</CxBadge>} title={t("语音识别")} />
               <CxRow badges={<CxBadge tone={local.nodeAvailable ? "ok" : "warn"}>{local.nodeAvailable ? t("已就绪") : t("缺少 Node.js")}</CxBadge>} title={t("运行环境")} />
+              {localTemplates.length > 1 ? (
+                <CxRow
+                  detail={t("录制 claude.ai 界面时的版本。新版本有问题时可以换回旧的；前端代码按所选版本从 Anthropic 下载。")}
+                  title={t("界面版本")}
+                >
+                  <AppSelect
+                    ariaLabel={t("界面版本")}
+                    disabled={localDisabled}
+                    menuWidth={300}
+                    onChange={(next) => void configureLocal({ ...local.config, template: next })}
+                    options={[
+                      { value: "", label: tf("最新（{0}）", [claudeTemplateLabel(localTemplates[0])]) },
+                      ...localTemplates.map((template) => ({ value: template.build, label: claudeTemplateLabel(template) })),
+                    ]}
+                    value={localTemplates.some((template) => template.build === local.config.template) ? local.config.template ?? "" : ""}
+                  />
+                </CxRow>
+              ) : null}
             </CxCard>
             <CxCard className="claude-l10n-feature-grid">
               {([
-                ["localization", "界面汉化", "本地界面汉化"],
-                ["voiceInput", "原生听写", "本地原生听写"],
-                ["computerUse", "电脑控制", "本地电脑控制"],
-                ["backgroundMode", "后台模式", "本地后台模式"],
-                ["forceBackgroundMode", "新系统也开后台模式", "本地后台模式不限系统版本"],
-              ] as const).map(([key, label, ariaLabel]) => (
+                ["localization", "界面汉化", "本地界面汉化", ""],
+                ["voiceInput", "原生听写", "本地原生听写", ""],
+                ["computerUse", "电脑控制", "本地电脑控制", ""],
+                ["backgroundMode", "后台模式", "本地后台模式", ""],
+                ["forceBackgroundMode", "新系统也开后台模式", "本地后台模式不限系统版本", "Claude 在较新的 macOS 上会提示「暂不支持后台模式」；打开后不再限制系统版本，未经 Claude 验证，可能不稳定"],
+                ["cowork", "Cowork", "本地 Cowork", "关掉后按 Claude 自己的开关，新版 Claude 通常只剩 Chat / Code。系统条件（Windows 需商店版、虚拟化可用）仍由 Claude 检查"],
+                ["hubHome", "合并式主页（实验）", "本地合并式主页", "Claude 正在小范围试验的主页布局：对话和 Cowork 合在一个输入框里，没有「对话 | Cowork」切换。关着时用有切换的经典主页"],
+              ] as const).map(([key, label, ariaLabel, hint]) => (
                 <label
                   className="switch-row compact"
                   key={key}
-                  title={key === "forceBackgroundMode"
-                    ? t("Claude 在较新的 macOS 上会提示「暂不支持后台模式」；打开后不再限制系统版本，未经 Claude 验证，可能不稳定")
-                    : undefined}
+                  title={hint ? t(hint) : undefined}
                 >
                   <input
                     aria-label={t(ariaLabel)}
-                    checked={local.config[key] ?? false}
+                    // 只有 Cowork 默认是开的。
+                    checked={local.config[key] ?? key === "cowork"}
                     disabled={localDisabled}
                     onChange={(event) => {
                       const checked = event.currentTarget.checked;
@@ -18001,7 +16543,7 @@ function routeSubtitle(route: Route, soloAgent: string | null = null) {
     skills: t("从 GitHub 仓库安装 Skill，按 Agent 启用到 Codex、Claude Code 或 Grok"),
     weixin: t("通过个人微信连接本机 Codex 会话"),
     enhance: t("管理常用功能、语音输入与下一步建议。"),
-    dreamSkin: t("Codex-Dream-Skin 风格主题和换图"),
+    dreamSkin: t("皮肤已移到 Codex 里，这里只留恢复默认皮肤的急救入口"),
     userScripts: t("万物皆拓展：内置、市场和自己做的拓展"),
     pluginMarket: t("检索插件，按需下载并安装到 Codex"),
     recommendations: t("来自 Codex++ 广告源的推荐，点卡片在浏览器里打开"),
@@ -18465,8 +17007,12 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
   const backendAggregates = new Map(
     (settings.aggregateRelayProfiles ?? []).map((aggregate) => [aggregate.id, aggregate] as const),
   );
-  const relayCommonConfigContents = settings.relayCommonConfigContents || "";
-  const relayContextConfigContents = settings.relayContextConfigContents || "";
+  const splitCommon = splitContextConfigText(settings.relayCommonConfigContents || "");
+  const relayCommonConfigContents = splitCommon.common;
+  const relayContextConfigContents = joinTomlSectionsRootFirst([
+    settings.relayContextConfigContents || "",
+    splitCommon.context,
+  ]);
   const defaultContextSelection = contextSelectionForAllEntries({
     ...settings,
     relayCommonConfigContents,

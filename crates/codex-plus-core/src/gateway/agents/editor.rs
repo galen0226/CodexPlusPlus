@@ -71,7 +71,12 @@ fn write_preferences(path: &Path, before: Option<&str>, text: &str) -> anyhow::R
         restore::read_optional(path)?.as_deref() == before,
         "保存期间配置已变更，请重新打开"
     );
-    files::write_file(path, Some(text))
+    files::write_file(path, Some(text))?;
+    ensure!(
+        restore::read_optional(path)?.as_deref() == Some(text),
+        "保存后回读不一致，请重新打开"
+    );
+    Ok(())
 }
 
 fn preferences(
@@ -141,8 +146,10 @@ fn preferences(
         let draft = parsed.as_object().context("设置必须是键值对象")?;
         validate_draft(fields, draft)?;
         if draft != &visible {
+            contents = format_view(draft)?;
             let text = if toml {
                 let mut doc = restore::parse_toml("配置", raw)?;
+                let pending = restore::parse_toml("配置", &contents)?;
                 let table = if let Some(section) = section {
                     doc.as_table_mut()
                         .entry(section)
@@ -156,19 +163,14 @@ fn preferences(
                     if draft.get(key) == visible.get(key) {
                         continue;
                     }
-                    let mut value = match draft.get(key) {
-                        Some(Value::String(text)) => toml_edit::Value::from(text.as_str()),
-                        Some(Value::Bool(value)) => toml_edit::Value::from(*value),
-                        Some(Value::Number(value)) => match value.as_i64() {
-                            Some(integer) => toml_edit::Value::from(integer),
-                            None => toml_edit::Value::from(value.as_f64().context("数字超出范围")?),
-                        },
-                        None => {
-                            table.remove(key);
-                            continue;
-                        }
-                        _ => anyhow::bail!("{key} 的值无效"),
+                    let Some(item) = pending.get(key) else {
+                        table.remove(key);
+                        continue;
                     };
+                    let mut value = item
+                        .as_value()
+                        .with_context(|| format!("{key} 的值无效"))?
+                        .clone();
                     if let Some(previous) =
                         table.get_mut(key).and_then(toml_edit::Item::as_value_mut)
                     {
@@ -187,7 +189,6 @@ fn preferences(
                 jsonc_edit::render(before.as_deref(), &doc)?
             };
             write_preferences(path, before.as_deref(), &text)?;
-            contents = format_view(draft)?;
         }
     }
     Ok(ConfigView {
@@ -209,62 +210,6 @@ fn validate_draft(
         ensure!(kind.accepts(value), "{key} 的值无效");
     }
     Ok(())
-}
-
-fn openchamber_preferences(
-    path: &Path,
-    fields: &[(&str, PreferenceKind)],
-    edit: Option<(&ConfigSnapshot, &str)>,
-) -> anyhow::Result<ConfigView> {
-    let source = path.display().to_string();
-    let before = restore::read_optional(path)?.context("偏好文件已移动，请重新打开")?;
-    let mut doc = jsonc_edit::read_preferences(&before)?;
-    ensure!(
-        doc.get("version") == Some(&Value::from(1)),
-        "不支持此偏好文件版本"
-    );
-    let entries = doc
-        .get_mut("fields")
-        .and_then(Value::as_object_mut)
-        .context("偏好文件缺少 fields")?;
-    let mut visible = Map::new();
-    for &(key, _) in fields {
-        if let Some(entry) = entries.get(key) {
-            let value = entry
-                .get("value")
-                .and_then(Value::as_str)
-                .with_context(|| format!("{key} 格式无效"))?;
-            visible.insert(key.into(), Value::from(value));
-        }
-    }
-    let mut contents = serde_json::to_string_pretty(&visible)?;
-    if let Some((original, next)) = edit {
-        original.check(&source, &contents)?;
-        let draft = jsonc_edit::preference_draft(next)?;
-        validate_draft(fields, &draft)?;
-        if draft != visible {
-            for &(key, _) in fields {
-                if draft.get(key) == visible.get(key) {
-                    continue;
-                }
-                if let Some(value) = draft.get(key) {
-                    let entry = entries.entry(key).or_insert_with(|| Value::Object(Map::new()));
-                    entry["value"] = value.clone();
-                    entry["updatedAt"] = Value::from(super::catalog_cli::now_ms());
-                } else {
-                    entries.remove(key);
-                }
-            }
-            let text = jsonc_edit::render(Some(&before), &doc)?;
-            write_preferences(path, Some(&before), &text)?;
-            contents = serde_json::to_string_pretty(&draft)?;
-        }
-    }
-    Ok(ConfigView {
-        snapshot: ConfigSnapshot { source, contents },
-        input_format: "JSON / JSONC",
-        editable: true,
-    })
 }
 
 /// 读取指定 Agent 的配置。传入原始快照和草稿时，只保存开放的字段并返回更新后的视图。
@@ -296,13 +241,11 @@ pub fn config(
     }
     let spec = spec(agent).context("未知的 Agent")?;
     let main_path = (spec.config_path)(&ctx.agent_env);
-    let versioned = agent == "openchamber" && main_path.try_exists()?;
     let path = match agent {
-        "jetbrains-air" => super::catalog_apps::air_opencode_config(&ctx.agent_env),
         "ante" | "codebuddy" | "vscode" | "vscode-insiders" | "vscodium" => {
             main_path.with_file_name("settings.json")
         }
-        "openchamber" if !versioned => main_path.with_file_name("settings.json"),
+        "openchamber" if !main_path.try_exists()? => main_path.with_file_name("settings.json"),
         "zcode" => ctx.agent_env.home_path(".zcode/v2/setting.json"),
         "claude-desktop-local" => return source_only("Claude Desktop · 进程环境".into(), edit),
         _ => main_path,
@@ -310,9 +253,6 @@ pub fn config(
     let Preferences::Editable { section, fields } = spec.preferences else {
         return source_only(path.display().to_string(), edit);
     };
-    if versioned {
-        return openchamber_preferences(&path, fields, edit);
-    }
     preferences(&path, agent, section, fields, edit)
 }
 

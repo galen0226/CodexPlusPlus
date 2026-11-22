@@ -655,7 +655,7 @@ fn write_jcode(env: &AgentEnv, wiring: &Wiring, set: &mut FileSet) -> anyhow::Re
 pub const JCODE: AgentSpec = AgentSpec {
     id: "jcode",
     preferences: Preferences::Editable {
-        section: Some("ui"),
+        section: Some("display"),
         fields: &[("theme", PreferenceKind::Text)],
     },
     name: "jcode",

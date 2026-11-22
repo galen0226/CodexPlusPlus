@@ -705,31 +705,6 @@ fn save_with_catalog_publisher(
 ) -> anyhow::Result<String> {
     recover_pending_catalog_refresh(store, home)?;
     let previous = store.load()?;
-    if previous.relay_common_config_contents != next.relay_common_config_contents {
-        let draft = crate::gateway::restore::parse_toml("通用配置", &next.relay_common_config_contents)?;
-        // 损坏的旧模板不能作为继承证据；修正稿仍按一份全新的模板完整校验。
-        let old = previous.relay_common_config_contents.parse().unwrap_or_default();
-        crate::session_tuning::validate_common_fields(&old, &draft)?;
-        return crate::session_tuning::save_common(
-            store,
-            next.clone(),
-            &old,
-            draft,
-            Some(&previous),
-            &[],
-            |store, clean| save_catalog_settings(store, home, &previous, clean, publish),
-        );
-    }
-    save_catalog_settings(store, home, &previous, next, publish)
-}
-
-fn save_catalog_settings(
-    store: &SettingsStore,
-    home: &Path,
-    previous: &BackendSettings,
-    next: &BackendSettings,
-    publish: impl FnOnce(&Path, &[u8]) -> anyhow::Result<()>,
-) -> anyhow::Result<String> {
     let Some(aggregate) = active_model_aggregation(next) else {
         return store.save_versioned(next);
     };
@@ -879,6 +854,19 @@ pub fn catalog_summary(
     }))
 }
 
+/// 官方池成员补的 GPT-6.2 Fast 档位，只解析一次。内置资产解析失败只可能是改坏了 JSON，
+/// 按空表处理（不补档位），`gpt62_fast_tiers_reach_the_gateway_catalog` 会兜住。
+fn official_fast_defaults() -> &'static Map<String, Value> {
+    static DEFAULTS: std::sync::OnceLock<Map<String, Value>> = std::sync::OnceLock::new();
+    DEFAULTS.get_or_init(|| {
+        crate::relay_config::parse_model_metadata_map(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/gpt62-model-metadata-compat.json"
+        )))
+        .unwrap_or_default()
+    })
+}
+
 pub(crate) fn build_member_catalog(profile: &RelayProfile) -> anyhow::Result<Value> {
     let entries = profile_catalog_entries(profile)?;
     if entries.is_empty() {
@@ -894,9 +882,31 @@ pub(crate) fn build_member_catalog(profile: &RelayProfile) -> anyhow::Result<Val
         false,
         None,
     );
-    let metadata = crate::relay_config::parse_model_metadata_map(&profile.model_metadata)?;
+    let mut metadata = crate::relay_config::parse_model_metadata_map(&profile.model_metadata)?;
+    // 官方池成员同步的是模型 ID，不一定有同版本的本机目录。只补已知型号的
+    // 官方 Fast 档位，不把同家族旧模板的能力移给未知型号或第三方供应商。
+    if crate::official_login::member_uses_official_login_transport(profile) {
+        let fast_defaults = official_fast_defaults();
+        for entry in &entries {
+            let slug = entry.slug.to_ascii_lowercase();
+            let Some(defaults) = fast_defaults.get(&slug) else {
+                continue;
+            };
+            if crate::model_suffix::requires_bundled_metadata_catalog(&slug) {
+                continue;
+            }
+            let fields = metadata.entry(slug).or_insert_with(|| json!({}));
+            if fields.get("service_tiers").is_none() && fields.get("additional_speed_tiers").is_none()
+            {
+                fields["service_tiers"] = defaults["service_tiers"].clone();
+                fields["additional_speed_tiers"] = defaults["additional_speed_tiers"].clone();
+            }
+        }
+    }
     let catalog_json =
         crate::relay_config::apply_model_metadata_overrides(&catalog_json, &metadata)?;
+    let catalog_json =
+        crate::gateway::opencode::apply_hy4_catalog_json_metadata(profile, &catalog_json)?;
     // 聚合代理按成员原生协议转发，成员上游不认 tool_search 时同样要在目录里关掉；
     // 放在元数据覆盖之后，已保存的整份元数据不能把它重新打开。
     let catalog_json = if crate::relay_config::upstream_rejects_tool_search(profile) {
@@ -1071,7 +1081,6 @@ mod tests {
     fn catalog_publication_failure_restores_settings_and_keeps_old_pointer() {
         let (_temp,store,home)=publication_fixture();let before=store.snapshot_raw_bytes().unwrap().unwrap();
         let config=std::fs::read(home.join("config.toml")).unwrap();let mut next=store.load().unwrap();next.relay_profiles[0].model_list.push_str("\nnew-fixture-model");
-        next.relay_common_config_contents = "tool_output_token_limit = 4096\n".into();
         let error=save_with_catalog_publisher(&store,&home,&next,|_,_|anyhow::bail!("injected publication failure")).unwrap_err();
         assert!(error.to_string().contains("发布失败"));assert_eq!(store.snapshot_raw_bytes().unwrap().unwrap(),before);
         assert_eq!(std::fs::read(home.join("config.toml")).unwrap(),config);

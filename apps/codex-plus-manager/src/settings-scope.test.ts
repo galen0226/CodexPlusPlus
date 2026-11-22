@@ -89,6 +89,6 @@ test("只用增强功能：隐藏供应商页面，配置保存成功后才提�
   assert.match(text, /if \(!routeVisible\(agentFocus, route\)\) void navigate\(agentHomeRoute\[activeTool\] \?\? "overview"\);/);
   assert.match(text, /closeAgentFocus = \(mode: FocusMode\) => commitAgentFocusSelection\(mode,/);
   assert.match(text, /normalizeSettings\(\{ \.\.\.latest\.settings, relayProfilesEnabled: false \}\)/);
-  assert.match(text, /acceptExternalSettings\(result\);\s*\/\/[^\n]*\n\s*setSettingsForm\(\(current\) => \(\{ \.\.\.current, relayProfilesEnabled: false \}\)\)/);
+  assert.match(text, /rebaseSettingsEdits\(normalizeSettings\(current\), previous, saved\)/);
   assert.doesNotMatch(text, /relayOffRequested/);
 });
