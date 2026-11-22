@@ -3265,6 +3265,9 @@ export const EN_PLAIN: Record<string, string> = {
   "选择已有供应商作为成员，保存后写入 settings payload": "Select existing providers as members; saving writes them to the settings payload",
   "选择应用目录": "Select app directory",
   "通用配置文件": "Common config file",
+  "编辑配置": "Edit configuration",
+  "配置来源": "Configuration source",
+  "配置只读": "Read-only configuration",
   "关闭窗口": "Close",
   "选择模型": "Pick a model",
   "搜索模型…": "Search models…",
@@ -3273,6 +3276,8 @@ export const EN_PLAIN: Record<string, string> = {
     "No model list yet — use the button on the left to fetch from upstream.",
   "应用通用配置": "Apply common config",
   "编辑通用配置": "Edit common config",
+  "供应商配置已变更。请保留需要的草稿，再返回列表重新打开。": "The provider configuration changed. Keep a copy of any edits you need, then return to the list and reopen the provider.",
+  "已保存。请重新应用使用通用配置的供应商。": "Saved. Reapply a provider that uses the common config.",
   "切换到此供应商时，会把通用配置合并进 config.toml。":
     "Switching to this provider merges the common config into config.toml.",
   "此供应商只写入自己的 config.toml，不合并通用配置。":
@@ -3955,6 +3960,8 @@ export const EN_PLAIN: Record<string, string> = {
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
   "当前主题：{0}": "Current theme: {0}",
+  "编辑 {0} 配置": "Edit {0} configuration",
+  "输入格式：{0}": "Input format: {0}",
   "{0} 个 Skill 失败": "{0} skill operation(s) failed",
   "已批量{0} {1} 个 Skill": "{0} {1} skill(s)",
   "删除 Skill 备份“{0}”？": "Delete skill backup \"{0}\"?",

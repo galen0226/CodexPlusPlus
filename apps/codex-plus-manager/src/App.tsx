@@ -127,6 +127,7 @@ import {
 } from "./context-config-text";
 import { summarizeRecentRequests, type RecentRequestSummary } from "./overview-model";
 import { AgentCollaborationPage } from "./AgentCollaborationPage";
+import { AgentConfigDialog, OpenAgentConfig, type ConfigTarget } from "./AgentConfigEditor";
 import { DshPluginsPanel } from "./DshPluginsPanel";
 import { ConfigDoctorPanel } from "./ConfigDoctorPanel";
 import { CommunityExtensionsPanel, type CommunitySort } from "./CommunityExtensionsPanel";
@@ -1763,17 +1764,23 @@ const defaultSettings: BackendSettings = {
 };
 
 export function App() {
+  const [configTarget, setConfigTarget] = useState<ConfigTarget | null>(null);
   useSyncExternalStore(subscribeLanguage, getLanguage, getLanguage);
   const [themePreference, setThemePreference] = useState<ThemePreference>(() => loadThemePreference());
   const [systemDark, setSystemDark] = useState(() => systemPrefersDark());
   const theme: Theme = resolveTheme(themePreference, systemDark);
-  const [route, setRoute] = useState<Route>(() => loadInitialRoute());
+  const [route, setRouteState] = useState<Route>(() => loadInitialRoute());
   /** 合并后的「设置」页里要滚到的分组（原来跳「关于」的地方滚到版本与更新、日志）。 */
   const [settingsFocus, setSettingsFocus] = useState<string | null>(() => initialSettingsFocus());
   /** 设置模式里整体设置页当前显示的卡片（一个分类一页）；深链到某张卡片时换到它所在的分类。 */
   const [settingsSections, setSettingsSections] = useState<string[]>(() => settingsSectionsFor(initialSettingsFocus() ?? "app-settings-general"));
   /** 从旧的「旧版代理设置」入口进来：「连接与供应商」页直接展开「高级」。 */
   const [relayAdvancedOpen, setRelayAdvancedOpen] = useState(false);
+  const [relayCommonOpen, setRelayCommonOpen] = useState(false);
+  const setRoute = useCallback((next: Route) => {
+    setRelayCommonOpen(false);
+    setRouteState(next);
+  }, []);
   /** 进设置模式前停的页面：侧栏「返回」回到这里。 */
   const lastMainRoute = useRef<Route>("hub");
   const [notice, setNotice] = useState<{ title: string; message: string; status?: Status } | null>(null);
@@ -3218,6 +3225,34 @@ export function App() {
     if (result) showNotice(t("设置保存"), result.message, result.status);
     // 保留草稿供用户重载后合并，不能拿最新版本号自动重试旧快照。
     return null;
+  };
+
+  const saveCommonTemplate = async (original: string, contents: string) => {
+    const current = await run(() => invoke<BackendSettings>("read_relay_common_config", { draft: contents }));
+    if (!current) return null;
+    if ((current.relayCommonConfigContents ?? "") !== original) {
+      showNotice(t("通用配置文件"), t("供应商配置已变更。请保留需要的草稿，再返回列表重新打开。"), "failed");
+      return null;
+    }
+    // 模板草稿不能用全局保存的自动重试覆盖刚被外部修改的模板。
+    const result = await run(() => invoke<SettingsResult>("save_settings", {
+      settings: { ...current, relayCommonConfigContents: contents },
+      expectedRevision: current.revision,
+    }));
+    if (!result || !isSuccessStatus(result.status)) {
+      if (result) showNotice(t("设置保存"), result.message, result.status);
+      return null;
+    }
+    const saved = normalizeSettings(result.settings);
+    const previous = normalizeSettings(settingsRef.current?.settings ?? current);
+    setSettings(result);
+    setSettingsForm(form => {
+      if (form.revision !== previous.revision) return form;
+      const merged = mergeRotatedAuthContents(rebaseSettingsEdits(form, previous, saved), previous, saved);
+      return { ...merged, relayCommonConfigContents: saved.relayCommonConfigContents };
+    });
+    showNotice(t("通用配置文件"), t("已保存。请重新应用使用通用配置的供应商。"), "ok");
+    return result;
   };
 
   const closeAgentFocus = (mode: FocusMode) => commitAgentFocusSelection(mode, {
@@ -4747,6 +4782,10 @@ export function App() {
         ) : null;
 
   return (
+    <OpenAgentConfig.Provider value={target => {
+      if (target.agent === "codex") setRelayCommonOpen(true);
+      else setConfigTarget(target);
+    }}>
     <div className={`shell ${theme}`}>
       <AppSidebar
         setupCard={setupCard}
@@ -4813,7 +4852,11 @@ export function App() {
       ) : null}
       {tourOpen && !agentFocusOpen ? <OnboardingTour focus={agentFocus} onClose={closeTour} /> : null}
       <main className="workspace">
+        {relayCommonOpen ? (
+          <RelayCommonConfigScreen onSave={saveCommonTemplate} onBack={() => setRelayCommonOpen(false)} />
+        ) : null}
         <section
+          style={relayCommonOpen ? { display: "none" } : undefined}
           className={`screen ${isManagementScreen ? "management-screen" : ""} ${route === "requestLog" ? "request-log-screen" : ""}`.trim()}
           data-settings-mode={settingsModeRoutes.has(route) ? "true" : undefined}
           key={route}
@@ -5146,6 +5189,7 @@ export function App() {
           </>)}
         </section>
       </main>
+      {configTarget ? <AgentConfigDialog key={configTarget.agent} {...configTarget} onClose={() => setConfigTarget(null)} /> : null}
       {updatePrompt && !agentFocusOpen && !tourOpen ? (
         <UpdateDialog
           update={updatePrompt}
@@ -5222,6 +5266,7 @@ export function App() {
         />
       ) : null}
     </div>
+    </OpenAgentConfig.Provider>
   );
 }
 
@@ -13627,6 +13672,59 @@ function SyncedTextarea({
       }}
       spellCheck={false}
     />
+  );
+}
+
+function RelayCommonConfigScreen({ onSave, onBack }: {
+  onSave: (original: string, contents: string) => Promise<SettingsResult | null>;
+  onBack: () => void;
+}) {
+  const [contents, setContents] = useState<string | null>(null);
+  const [draft, setDraft] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    void invoke<BackendSettings>("read_relay_common_config").then(settings => {
+      if (!cancelled) setContents(settings.relayCommonConfigContents ?? "");
+    }).catch(error => { if (!cancelled) setLoadError(stringifyError(error)); });
+    return () => { cancelled = true; };
+  }, []);
+  const save = async () => {
+    if (contents === null || draft === null || saving) return;
+    setSaving(true);
+    try {
+      const result = await onSave(contents, draft);
+      if (result) {
+        setContents(result.settings.relayCommonConfigContents ?? "");
+        setDraft(null);
+      }
+    } finally {
+      setSaving(false);
+    }
+  };
+  return (
+    <section className="screen management-screen">
+      <header className="cx-page-head" data-tauri-drag-region="deep">
+        <div className="cx-page-title"><h1>{t("通用配置文件")}</h1></div>
+        <div className="topbar-actions">
+          {contents !== null ? <Button type="button" disabled={draft === null || saving} onClick={() => void save()}>
+            <Save className="h-4 w-4" />
+            {t("保存")}
+          </Button> : null}
+          <Button variant="ghost" onClick={onBack}>{t("返回列表")}</Button>
+        </div>
+      </header>
+      {contents !== null
+        ? <fieldset className="min-w-0" disabled={saving}>
+            <SyncedTextarea
+              className="relay-file-textarea"
+              value={draft ?? contents}
+              onValueChange={text => setDraft(text === contents ? null : text)}
+            />
+          </fieldset>
+        : <p role={loadError ? "alert" : "status"}>{loadError ?? t("正在读取…")}</p>}
+    </section>
   );
 }
 
