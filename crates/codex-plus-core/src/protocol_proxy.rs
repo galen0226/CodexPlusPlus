@@ -13386,6 +13386,31 @@ fn is_phaseless_assistant_message_done(event_type: &str, data: &Value) -> bool {
         && item.get("phase").is_none_or(Value::is_null)
 }
 
+/// 消息文本是否以独立的 `::指令{...}` UI 标记开头（如 CUA 插件的
+/// `::browser-complete{...}`，issue #3244）。这类标记必须作为 `commentary`
+/// 消息交给 Codex 桌面端消费，不能被补成 `final_answer` 落进聊天正文。
+fn message_starts_with_ui_directive(data: &Value) -> bool {
+    data.pointer("/item/content")
+        .and_then(Value::as_array)
+        .is_some_and(|parts| {
+            parts.iter().any(|part| {
+                let Some(text) = part.get("text").and_then(Value::as_str) else {
+                    return false;
+                };
+                let text = text.trim_start();
+                let rest = text.strip_prefix("::").unwrap_or(text);
+                let name_len = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                    .count();
+                // `::` 后紧跟名字和 `{`，且不是空名字的普通文本。
+                name_len > 0
+                    && text.starts_with("::")
+                    && rest[name_len..].starts_with('{')
+            })
+        })
+}
+
 impl MessagePhaseFill {
     /// 观察一个事件；返回需要先于该事件写出的暂存消息字节，
     /// 以及当前事件本身是否被暂存（被暂存时调用方不应再写出它）。
@@ -13415,6 +13440,10 @@ impl MessagePhaseFill {
                 "response.completed" => {
                     let phase = if self.saw_client_tool_call {
                         "commentary"
+                    } else if self.pending_is_ui_directive() {
+                        // `::browser-complete{...}` 这类 UI 指令要作为
+                        // commentary 消息交给客户端消费（issue #3244）。
+                        "commentary"
                     } else {
                         "final_answer"
                     };
@@ -13431,6 +13460,14 @@ impl MessagePhaseFill {
             return (out, true);
         }
         (out, false)
+    }
+
+    /// 暂存的消息是否以独立的 `::指令{...}` UI 标记开头。
+    fn pending_is_ui_directive(&self) -> bool {
+        self.pending
+            .as_ref()
+            .map(|(_, data)| message_starts_with_ui_directive(data))
+            .unwrap_or(false)
     }
 
     /// 放行暂存的消息；`phase` 为 `None` 时原样写出。
@@ -14031,6 +14068,45 @@ mod responses_sse_transformer_tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.ends_with(&completed), "消息必须先于 completed 写出: {text}");
         assert!(t.finish().is_none());
+    }
+
+    #[test]
+    fn browser_complete_ui_directive_message_becomes_commentary() {
+        // issue #3244：CUA 结束时最后一条响应只有 `::browser-complete{...}`，
+        // 没有工具调用，也应补成 commentary 交给客户端消费。
+        let directive = sse(json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "msg_2",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{ "type": "output_text", "text": "::browser-complete{title=\"Blocked GitHub banner upload\"}", "annotations": [] }]
+            }
+        }));
+        let mut t = ResponsesSseTransformer::for_request(None).filling_message_phase(true);
+        assert!(t.push_bytes(directive.as_bytes()).is_empty());
+        let completed = sse(json!({ "type": "response.completed", "response": {} }));
+        let out = t.push_bytes(completed.as_bytes());
+        assert_eq!(message_phases(&out), vec![Some("commentary".to_string())]);
+
+        // 普通 `::` 前缀文本（无指令形状）不受影响，仍是 final_answer。
+        let plain = sse(json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "msg_3",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{ "type": "output_text", "text": "结果 :: 出现在正文里", "annotations": [] }]
+            }
+        }));
+        let mut t = ResponsesSseTransformer::for_request(None).filling_message_phase(true);
+        assert!(t.push_bytes(plain.as_bytes()).is_empty());
+        let out = t.push_bytes(completed.as_bytes());
+        assert_eq!(message_phases(&out), vec![Some("final_answer".to_string())]);
     }
 
     #[test]
